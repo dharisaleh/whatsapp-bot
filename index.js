@@ -1,51 +1,98 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const express = require('express');
+const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
-const qrcode = require('qrcode-terminal');
 const fs = require('fs');
+
+const app = express();
+app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const lawText = fs.readFileSync('law.txt', 'utf8');
 const userCount = {};
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth');
-  const sock = makeWASocket({ auth: state });
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-  sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = update;
-    if (qr) {
-      console.log('\n\n========== امسح QR Code من واتساب ==========\n');
-      qrcode.generate(qr, { small: true });
-      console.log('\n=============================================\n\n');
-    }
-    if (connection === 'open') console.log('✅ البوت متصل بواتساب بنجاح!');
-    if (connection === 'close') startBot();
-  });
+// Webhook verification (Meta requirement)
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('✅ Webhook verified');
+    res.status(200).send(challenge);
+  } else {
+    res.sendStatus(403);
+  }
+});
 
-    const from = msg.key.remoteJid;
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-    if (!text) return;
+// Receive messages from WhatsApp
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const entry = req.body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const message = changes?.value?.messages?.[0];
+
+    if (!message || message.type !== 'text') return;
+
+    const from = message.from;
+    const text = message.text.body;
+
+    console.log(`📩 Message from ${from}: ${text}`);
 
     userCount[from] = (userCount[from] || 0) + 1;
 
     if (userCount[from] > 3) {
-      await sock.sendMessage(from, { text: 'انتهت أسئلتك المجانية. للاستمرار يرجى الدفع.' });
+      await sendMessage(from, 'انتهت أسئلتك المجانية. للاستمرار يرجى الاشتراك.');
       return;
     }
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 1024,
-      messages: [{ role: 'user', content: `بناءً على هذا القانون:\n${lawText}\n\nالسؤال: ${text}` }]
+      messages: [{
+        role: 'user',
+        content: `أنت مساعد قانوني متخصص في القانون التعاوني. أجب على السؤال بناءً على القانون التالي فقط:\n\n${lawText}\n\nالسؤال: ${text}`
+      }]
     });
 
-    await sock.sendMessage(from, { text: response.content[0].text });
-  });
+    const reply = response.content[0].text;
+    await sendMessage(from, reply);
+
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+  }
+});
+
+// Send message to WhatsApp user
+async function sendMessage(to, text) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'text',
+        text: { body: text }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    console.log(`✅ Reply sent to ${to}`);
+  } catch (error) {
+    console.error('❌ Send error:', error.response?.data || error.message);
+  }
 }
 
-startBot();
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Bot running on port ${PORT}`);
+});
