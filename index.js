@@ -10,7 +10,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const lawText = fs.readFileSync('law.txt', 'utf8');
 const userCount = {};
 
-const WHITELIST = ['96555667373'];
+const WHITELIST = ['96555667373']; 
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
