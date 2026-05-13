@@ -14,38 +14,28 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// Webhook verification (Meta requirement)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('✅ Webhook verified');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
-// Receive messages from WhatsApp
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   try {
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
-
-    if (!message || message.type !== 'text') return;
-
+    const entry = req.body.entry?.[0]?.changes?.[0]?.value;
+    const message = entry?.messages?.[0];
+    if (!message) return;
     const from = message.from;
-    const text = message.text.body;
-
-    console.log(`📩 Message from ${from}: ${text}`);
+    const text = message.text?.body;
+    if (!text) return;
 
     userCount[from] = (userCount[from] || 0) + 1;
-
     if (userCount[from] > 3) {
       await sendMessage(from, 'انتهت أسئلتك المجانية. للاستمرار يرجى الاشتراك.');
       return;
@@ -54,21 +44,23 @@ app.post('/webhook', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: `أنت مساعد قانوني متخصص في القانون التعاوني. أجب على السؤال بناءً على القانون التالي فقط:\n\n${lawText}\n\nالسؤال: ${text}`
-      }]
+      system: [
+        {
+          type: 'text',
+          text: 'أنت مساعد قانوني متخصص في القانون التعاوني الكويتي. أجب على الأسئلة بناءً على القانون التالي فقط. لا تستخدم تنسيق Markdown مثل ** أو ## أو * في ردودك، اكتب نص عادي فقط مناسب للواتساب.\n\n' + lawText,
+            cache_control: { type: 'ephemeral' }
+        }
+      ],
+      messages: [{ role: 'user', content: text }]
     });
 
     const reply = response.content[0].text;
     await sendMessage(from, reply);
-
   } catch (error) {
-    console.error('❌ Error:', error.message);
+    console.error('Error:', error.message);
   }
 });
 
-// Send message to WhatsApp user
 async function sendMessage(to, text) {
   try {
     await axios.post(
@@ -86,13 +78,13 @@ async function sendMessage(to, text) {
         }
       }
     );
-    console.log(`✅ Reply sent to ${to}`);
+    console.log(`Reply sent to ${to}`);
   } catch (error) {
-    console.error('❌ Send error:', error.response?.data || error.message);
+    console.error('Send error:', error.response?.data || error.message);
   }
 }
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Bot running on port ${PORT}`);
+  console.log(`Bot running on port ${PORT}`);
 });
