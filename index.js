@@ -10,6 +10,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const lawText = fs.readFileSync('law.txt', 'utf8');
 const userCount = {};
 
+const WHITELIST = ['96555667373'];
+
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -35,10 +37,12 @@ app.post('/webhook', async (req, res) => {
     const text = message.text?.body;
     if (!text) return;
 
-    userCount[from] = (userCount[from] || 0) + 1;
-    if (userCount[from] > 3) {
-      await sendMessage(from, 'انتهت أسئلتك المجانية. للاستمرار يرجى الاشتراك.');
-      return;
+    if (!WHITELIST.includes(from)) {
+      userCount[from] = (userCount[from] || 0) + 1;
+      if (userCount[from] > 3) {
+        await sendMessage(from, 'انتهت أسئلتك المجانية. للاستمرار يرجى الاشتراك.');
+        return;
+      }
     }
 
     const response = await anthropic.messages.create({
@@ -48,7 +52,7 @@ app.post('/webhook', async (req, res) => {
         {
           type: 'text',
           text: 'أنت مساعد قانوني متخصص في القانون التعاوني الكويتي. أجب على الأسئلة بناءً على القانون التالي فقط. لا تستخدم تنسيق Markdown مثل ** أو ## أو * في ردودك، اكتب نص عادي فقط مناسب للواتساب.\n\n' + lawText,
-            cache_control: { type: 'ephemeral' }
+          cache_control: { type: 'ephemeral' }
         }
       ],
       messages: [{ role: 'user', content: text }]
