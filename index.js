@@ -10,7 +10,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const lawText = fs.readFileSync('law.txt', 'utf8');
 const userCount = {};
 
-const WHITELIST = ['96555667373']; 
+const WHITELIST = ['96555667373'];
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
@@ -45,13 +45,26 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
+    const systemPrompt = `أنت مساعد قانوني للقانون التعاوني الكويتي.
+
+قواعد مهمة جداً يجب اتباعها في كل رد:
+- ممنوع منعاً باتاً استخدام علامة # أو ## أو ### في أي مكان من الرد
+- ممنوع منعاً باتاً استخدام علامة * أو ** في أي مكان من الرد
+- اكتب نص عادي فقط بدون أي تنسيق
+- للعناوين استخدم سطر جديد فقط
+- للقوائم استخدم أرقام عادية مثل 1. 2. 3.
+
+أجب على الأسئلة بناءً على القانون التالي فقط:
+
+${lawText}`;
+
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 1024,
       system: [
         {
           type: 'text',
-          text: 'أنت مساعد قانوني متخصص في القانون التعاوني الكويتي. أجب على الأسئلة بناءً على القانون التالي فقط. لا تستخدم تنسيق Markdown مثل ** أو ## أو * في ردودك، اكتب نص عادي فقط مناسب للواتساب.\n\n' + lawText,
+          text: systemPrompt,
           cache_control: { type: 'ephemeral' }
         }
       ],
