@@ -11,16 +11,12 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // قراءة ملف الفهرس
 const sectionsData = JSON.parse(fs.readFileSync('sections.json', 'utf8'));
 
-// قراءة كل الأقسام في الذاكرة (لتسريع الوصول)
-const sectionsContent = {};
+// قراءة كل الأقسام ودمجها في نص واحد
+let allLawText = '';
 for (const section of sectionsData.sections) {
-  sectionsContent[section.id] = fs.readFileSync(section.file, 'utf8');
+  const content = fs.readFileSync(section.file, 'utf8');
+  allLawText += `\n\n========== ${section.title} ==========\n\n${content}`;
 }
-
-// بناء نص فهرس الأقسام لـ Claude
-const sectionsIndex = sectionsData.sections.map(s => 
-  `- ${s.id}: ${s.title}\n  ${s.description}`
-).join('\n\n');
 
 const userCount = {};
 const WHITELIST = ['96555667373'];
@@ -58,35 +54,6 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // المرحلة 1: تحديد الأقسام المتعلقة بالسؤال
-    const routingResponse = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 200,
-      system: `أنت موجه ذكي. مهمتك تحديد الأقسام المتعلقة بسؤال المستخدم من قائمة الأقسام التالية:
-
-${sectionsIndex}
-
-أجب فقط بأسماء معرفات الأقسام (id) المتعلقة بالسؤال، مفصولة بفواصل. مثلاً: law,decision_46
-لا تكتب أي شيء آخر، فقط المعرفات.`,
-      messages: [{ role: 'user', content: text }]
-    });
-
-    const sectionIds = routingResponse.content[0].text.trim().split(',').map(s => s.trim());
-    
-    // جمع محتوى الأقسام المختارة
-    let relevantContent = '';
-    for (const id of sectionIds) {
-      if (sectionsContent[id]) {
-        relevantContent += sectionsContent[id] + '\n\n';
-      }
-    }
-    
-    // إذا ما لقى شي، استخدم القانون الأساسي
-    if (!relevantContent) {
-      relevantContent = sectionsContent['law'];
-    }
-
-    // المرحلة 2: الإجابة على السؤال
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 1024,
@@ -95,25 +62,35 @@ ${sectionsIndex}
           type: 'text',
           text: `أنت مساعد قانوني للقانون التعاوني الكويتي.
 
-قواعد مهمة جداً يجب اتباعها في كل رد:
-- ممنوع منعاً باتاً استخدام علامة # أو ## أو ### في أي مكان من الرد
-- ممنوع منعاً باتاً استخدام علامة * أو ** في أي مكان من الرد
-- اكتب نص عادي فقط بدون أي تنسيق
-- للعناوين استخدم سطر جديد فقط
-- للقوائم استخدم أرقام عادية مثل 1. 2. 3.
-- اذكر دائماً مصدر المعلومة (قانون / لائحة / قرار وزاري)
+قواعد التنسيق المطلقة (يجب الالتزام بها 100%):
+- ممنوع منعاً باتاً استخدام الرموز التالية في أي مكان من الرد: # ## ### * **
+- اكتب نص عادي بحت بدون أي رموز تنسيق
+- ابدأ الرد مباشرة بالإجابة بدون عنوان
+- للترقيم استخدم: 1. 2. 3. أو أولاً، ثانياً، ثالثاً
+- اذكر مصدر المعلومة داخل النص مثل: حسب القانون رقم 24 المادة 10، أو حسب القرار الوزاري 165
+
+قواعد الإجابة:
+- اقرأ كل النصوص القانونية بعناية قبل الإجابة
+- ابحث في القانون والقرارات واللوائح كلها
+- إذا وجدت معلومة في أي مصدر، اذكرها مع المصدر
+- إذا كانت المعلومة في عدة مصادر، اذكر كل المصادر
 - إذا تعارض القانون مع قرار وزاري، الأولوية للقانون
+- لا تقل "لا توجد مادة" إلا بعد التأكد من كل النصوص
+- كن دقيقاً ومختصراً
 
-أجب على الأسئلة بناءً على النصوص القانونية التالية فقط:
-
-${relevantContent}`,
+النصوص القانونية:
+${allLawText}`,
           cache_control: { type: 'ephemeral' }
         }
       ],
       messages: [{ role: 'user', content: text }]
     });
 
-    const reply = response.content[0].text;
+    let reply = response.content[0].text;
+    
+    // إزالة أي رموز Markdown متبقية احتياطياً
+    reply = reply.replace(/#{1,6}\s/g, '').replace(/\*\*/g, '').replace(/\*/g, '');
+    
     await sendMessage(from, reply);
   } catch (error) {
     console.error('Error:', error.message);
