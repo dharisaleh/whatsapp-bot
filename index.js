@@ -7,9 +7,22 @@ const app = express();
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const lawText = fs.readFileSync('law.txt', 'utf8');
-const userCount = {};
 
+// قراءة ملف الفهرس
+const sectionsData = JSON.parse(fs.readFileSync('sections.json', 'utf8'));
+
+// قراءة كل الأقسام في الذاكرة (لتسريع الوصول)
+const sectionsContent = {};
+for (const section of sectionsData.sections) {
+  sectionsContent[section.id] = fs.readFileSync(section.file, 'utf8');
+}
+
+// بناء نص فهرس الأقسام لـ Claude
+const sectionsIndex = sectionsData.sections.map(s => 
+  `- ${s.id}: ${s.title}\n  ${s.description}`
+).join('\n\n');
+
+const userCount = {};
 const WHITELIST = ['96555667373'];
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -45,7 +58,42 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    const systemPrompt = `أنت مساعد قانوني للقانون التعاوني الكويتي.
+    // المرحلة 1: تحديد الأقسام المتعلقة بالسؤال
+    const routingResponse = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      system: `أنت موجه ذكي. مهمتك تحديد الأقسام المتعلقة بسؤال المستخدم من قائمة الأقسام التالية:
+
+${sectionsIndex}
+
+أجب فقط بأسماء معرفات الأقسام (id) المتعلقة بالسؤال، مفصولة بفواصل. مثلاً: law,decision_46
+لا تكتب أي شيء آخر، فقط المعرفات.`,
+      messages: [{ role: 'user', content: text }]
+    });
+
+    const sectionIds = routingResponse.content[0].text.trim().split(',').map(s => s.trim());
+    
+    // جمع محتوى الأقسام المختارة
+    let relevantContent = '';
+    for (const id of sectionIds) {
+      if (sectionsContent[id]) {
+        relevantContent += sectionsContent[id] + '\n\n';
+      }
+    }
+    
+    // إذا ما لقى شي، استخدم القانون الأساسي
+    if (!relevantContent) {
+      relevantContent = sectionsContent['law'];
+    }
+
+    // المرحلة 2: الإجابة على السؤال
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1024,
+      system: [
+        {
+          type: 'text',
+          text: `أنت مساعد قانوني للقانون التعاوني الكويتي.
 
 قواعد مهمة جداً يجب اتباعها في كل رد:
 - ممنوع منعاً باتاً استخدام علامة # أو ## أو ### في أي مكان من الرد
@@ -53,18 +101,12 @@ app.post('/webhook', async (req, res) => {
 - اكتب نص عادي فقط بدون أي تنسيق
 - للعناوين استخدم سطر جديد فقط
 - للقوائم استخدم أرقام عادية مثل 1. 2. 3.
+- اذكر دائماً مصدر المعلومة (قانون / لائحة / قرار وزاري)
+- إذا تعارض القانون مع قرار وزاري، الأولوية للقانون
 
-أجب على الأسئلة بناءً على القانون التالي فقط:
+أجب على الأسئلة بناءً على النصوص القانونية التالية فقط:
 
-${lawText}`;
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 1024,
-      system: [
-        {
-          type: 'text',
-          text: systemPrompt,
+${relevantContent}`,
           cache_control: { type: 'ephemeral' }
         }
       ],
