@@ -116,16 +116,65 @@ app.post('/webhook', async (req, res) => {
     const reply = response.content[0].text;
     conversationHistory[from].push({ role: 'assistant', content: reply });
 
-    // الاحتفاظ بآخر 10 رسائل فقط لتوفير الذاكرة
+    // الاحتفاظ بآخر 20 رسالة فقط
     if (conversationHistory[from].length > 20) {
       conversationHistory[from] = conversationHistory[from].slice(-20);
     }
 
-    await sendMessage(from, reply);
+    // تقسيم الرسالة الطويلة إلى أجزاء صغيرة (واتساب يقبل 4096 حرف فقط)
+    const chunks = splitMessage(reply, 3900);
+    for (let i = 0; i < chunks.length; i++) {
+      await sendMessage(from, chunks[i]);
+      // تأخير صغير بين الرسائل
+      if (i < chunks.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
   }
 });
+
+// دالة تقسيم الرسالة الطويلة لأجزاء، تحافظ على الفقرات
+function splitMessage(text, maxLength) {
+  if (text.length <= maxLength) return [text];
+
+  const chunks = [];
+  const paragraphs = text.split('\n\n');
+  let currentChunk = '';
+
+  for (const paragraph of paragraphs) {
+    // لو الفقرة لحالها أطول من الحد الأقصى، قسّمها بالسطور
+    if (paragraph.length > maxLength) {
+      if (currentChunk) {
+        chunks.push(currentChunk.trim());
+        currentChunk = '';
+      }
+      const lines = paragraph.split('\n');
+      for (const line of lines) {
+        if ((currentChunk + '\n' + line).length > maxLength) {
+          if (currentChunk) chunks.push(currentChunk.trim());
+          currentChunk = line;
+        } else {
+          currentChunk += (currentChunk ? '\n' : '') + line;
+        }
+      }
+    } else if ((currentChunk + '\n\n' + paragraph).length > maxLength) {
+      chunks.push(currentChunk.trim());
+      currentChunk = paragraph;
+    } else {
+      currentChunk += (currentChunk ? '\n\n' : '') + paragraph;
+    }
+  }
+
+  if (currentChunk) chunks.push(currentChunk.trim());
+
+  // إضافة ترقيم للأجزاء إذا كانت أكثر من واحد
+  if (chunks.length > 1) {
+    return chunks.map((chunk, i) => `[${i + 1}/${chunks.length}]\n\n${chunk}`);
+  }
+  return chunks;
+}
 
 async function sendMessage(to, text) {
   try {
