@@ -2,11 +2,37 @@ const express = require('express');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
 const fs = require('fs');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// الاتصال بقاعدة البيانات
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// إنشاء جدول المستخدمين تلقائياً عند بدء التشغيل
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        phone VARCHAR(20) PRIMARY KEY,
+        free_questions_used INTEGER DEFAULT 0,
+        subscribed_until DATE,
+        daily_questions INTEGER DEFAULT 0,
+        last_question_date DATE
+      )
+    `);
+    console.log('Database table ready');
+  } catch (error) {
+    console.error('Database init error:', error.message);
+  }
+}
+initDatabase();
 
 // قراءة ملف الفهرس
 const sectionsData = JSON.parse(fs.readFileSync('sections.json', 'utf8'));
@@ -18,14 +44,84 @@ for (const section of sectionsData.sections) {
   allLawText += `\n\n========== ${section.title} ==========\n\n${content}`;
 }
 
-// تخزين سجل المحادثات لكل مستخدم
+// تخزين سجل المحادثات لكل مستخدم (في الذاكرة - مؤقت)
 const conversationHistory = {};
-const userCount = {};
 const WHITELIST = ['96555667373'];
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+
+const FREE_LIMIT = 2;
+const DAILY_LIMIT = 10;
+
+// الحصول على التاريخ الحالي بتوقيت الكويت (YYYY-MM-DD)
+function getKuwaitDate() {
+  const now = new Date();
+  const kuwaitTime = new Date(now.getTime() + (3 * 60 * 60 * 1000)); // UTC+3
+  return kuwaitTime.toISOString().split('T')[0];
+}
+
+// التحقق من حالة المستخدم وصلاحية إرسال سؤال
+async function checkUserAccess(phone) {
+  // الرقم في القائمة البيضاء - بلا حدود
+  if (WHITELIST.includes(phone)) {
+    return { allowed: true };
+  }
+
+  const today = getKuwaitDate();
+
+  // جلب بيانات المستخدم
+  let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+
+  // مستخدم جديد - نسجله
+  if (result.rows.length === 0) {
+    await pool.query(
+      'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 0, $2)',
+      [phone, today]
+    );
+    return { allowed: true };
+  }
+
+  const user = result.rows[0];
+
+  // التحقق من الاشتراك
+  const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
+
+  if (isSubscribed) {
+    // مشترك - نتحقق من الحد اليومي
+    let dailyCount = user.daily_questions;
+    const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
+
+    // يوم جديد - نصفّر العداد اليومي
+    if (lastDate !== today) {
+      dailyCount = 0;
+    }
+
+    if (dailyCount >= DAILY_LIMIT) {
+      return { allowed: false, reason: 'daily_limit' };
+    }
+
+    // نزيد العداد اليومي
+    await pool.query(
+      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+      [dailyCount + 1, today, phone]
+    );
+    return { allowed: true };
+  } else {
+    // غير مشترك - نتحقق من الأسئلة المجانية
+    if (user.free_questions_used >= FREE_LIMIT) {
+      return { allowed: false, reason: 'free_limit' };
+    }
+
+    // نزيد عداد الأسئلة المجانية
+    await pool.query(
+      'UPDATE users SET free_questions_used = free_questions_used + 1 WHERE phone = $1',
+      [phone]
+    );
+    return { allowed: true };
+  }
+}
 
 // التعليمات الثابتة
 const SYSTEM_INSTRUCTIONS = `أنت مساعد قانوني كويتي ودود متخصص في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت. مصادرك القانونية هي تسعة فقط لا غير:
@@ -236,16 +332,7 @@ const SYSTEM_INSTRUCTIONS = `أنت مساعد قانوني كويتي ودود 
 
 🏪 استخدام القرار 75/أ لسنة 2019:
 
-إذا السؤال متعلق بالمواضيع التالية، ابحث في القرار 75/أ لسنة 2019:
-- المشروعات الصغيرة بالجمعيات التعاونية
-- شروط صاحب العمل (المبادر)
-- المحلات والقيمة الاستثمارية
-- القواطع وضوابطها
-- آلية طرح المحلات والترسية
-- لجان المشروعات الصغيرة
-- الأولوية في قبول الطلبات
-- مدة عقود الاستثمار
-- الإعفاءات الإيجارية
+إذا السؤال متعلق بالمشروعات الصغيرة بالجمعيات، شروط صاحب العمل، المحلات والقيمة الاستثمارية، القواطع، آلية الطرح والترسية، لجان المشروعات، الأولوية في القبول، مدة العقود، الإعفاءات الإيجارية، ابحث في القرار 75/أ لسنة 2019.
 
 📜 استخدام الردود الرسمية:
 
@@ -328,12 +415,16 @@ app.post('/webhook', async (req, res) => {
     const text = message.text?.body;
     if (!text) return;
 
-    if (!WHITELIST.includes(from)) {
-      userCount[from] = (userCount[from] || 0) + 1;
-      if (userCount[from] > 3) {
-        await sendMessage(from, 'انتهت أسئلتك المجانية. للاستمرار يرجى الاشتراك.');
-        return;
+    // التحقق من صلاحية المستخدم
+    const access = await checkUserAccess(from);
+
+    if (!access.allowed) {
+      if (access.reason === 'free_limit') {
+        await sendMessage(from, 'انتهت أسئلتك المجانية 🔒\n\nللاستمرار والحصول على 10 أسئلة يومياً، يرجى الاشتراك.\n\nللاشتراك تواصل معنا.');
+      } else if (access.reason === 'daily_limit') {
+        await sendMessage(from, 'وصلت الحد اليومي (10 أسئلة) ⏰\n\nتقدر تسأل من جديد بكرا. شكراً لك 🌟');
       }
+      return;
     }
 
     if (!conversationHistory[from]) {
