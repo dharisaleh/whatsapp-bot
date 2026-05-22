@@ -15,7 +15,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// إنشاء جدول المستخدمين تلقائياً عند بدء التشغيل
+// إنشاء جدول المستخدمين تلقائياً
 async function initDatabase() {
   try {
     await pool.query(`
@@ -44,7 +44,6 @@ for (const section of sectionsData.sections) {
   allLawText += `\n\n========== ${section.title} ==========\n\n${content}`;
 }
 
-// تخزين سجل المحادثات لكل مستخدم (في الذاكرة - مؤقت)
 const conversationHistory = {};
 const WHITELIST = ['96555667373'];
 
@@ -55,26 +54,62 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const FREE_LIMIT = 2;
 const DAILY_LIMIT = 10;
 
-// الحصول على التاريخ الحالي بتوقيت الكويت (YYYY-MM-DD)
+// كلمات التحية والردود القصيرة (لا تُحسب كسؤال ولا تستهلك API)
+const GREETINGS = [
+  'السلام عليكم', 'سلام عليكم', 'السلام', 'مرحبا', 'مرحبتين', 'هلا', 'هلو',
+  'هاي', 'اهلا', 'أهلا', 'صباح الخير', 'مساء الخير', 'صباح النور', 'مساء النور',
+  'شكرا', 'شكراً', 'تسلم', 'يعطيك العافية', 'مشكور', 'ثانكس', 'تسلمين',
+  'نعم', 'لا', 'اوك', 'أوك', 'تمام', 'زين', 'طيب', 'ماشي', 'اوكي', 'حياك',
+  'مع السلامة', 'باي', 'وعليكم السلام'
+];
+
+// التحقق إذا كانت الرسالة مجرد تحية أو رد قصير
+function isGreeting(text) {
+  const cleaned = text.trim().replace(/[؟?.!،,]/g, '').toLowerCase();
+  // إذا كانت الرسالة قصيرة جداً وتطابق إحدى التحيات
+  if (cleaned.length <= 25) {
+    return GREETINGS.some(g => cleaned === g || cleaned === g.replace(/[أإآ]/g, 'ا'));
+  }
+  return false;
+}
+
+// رد التحية المحلي (بدون استدعاء Claude)
+function getGreetingReply(text) {
+  const cleaned = text.trim().replace(/[؟?.!،,]/g, '');
+  
+  // السلام
+  if (cleaned.includes('سلام')) {
+    return 'و عليكم السلام و رحمة الله وبركاته 👋\nياهلا أنا هنا أساعدك في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.';
+  }
+  // الشكر
+  if (cleaned.includes('شكر') || cleaned.includes('تسلم') || cleaned.includes('العافية') || cleaned.includes('مشكور') || cleaned.includes('ثانكس')) {
+    return 'الله يحفظك 🌟 أي وقت تحتاج مساعدة في العمل التعاوني أنا حاضر.';
+  }
+  // الوداع
+  if (cleaned.includes('سلامة') || cleaned.includes('باي')) {
+    return 'مع السلامة 👋 في أمان الله.';
+  }
+  // التحيات العامة
+  return 'هلا والله 👋 أنا هنا أساعدك في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت. تفضل اسأل.';
+}
+
+// الحصول على التاريخ الحالي بتوقيت الكويت
 function getKuwaitDate() {
   const now = new Date();
-  const kuwaitTime = new Date(now.getTime() + (3 * 60 * 60 * 1000)); // UTC+3
+  const kuwaitTime = new Date(now.getTime() + (3 * 60 * 60 * 1000));
   return kuwaitTime.toISOString().split('T')[0];
 }
 
 // التحقق من حالة المستخدم وصلاحية إرسال سؤال
 async function checkUserAccess(phone) {
-  // الرقم في القائمة البيضاء - بلا حدود
   if (WHITELIST.includes(phone)) {
     return { allowed: true };
   }
 
   const today = getKuwaitDate();
-
-  // جلب بيانات المستخدم
   let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
 
-  // مستخدم جديد - نسجله
+  // مستخدم جديد
   if (result.rows.length === 0) {
     await pool.query(
       'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 0, $2)',
@@ -84,16 +119,12 @@ async function checkUserAccess(phone) {
   }
 
   const user = result.rows[0];
-
-  // التحقق من الاشتراك
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
 
   if (isSubscribed) {
-    // مشترك - نتحقق من الحد اليومي
     let dailyCount = user.daily_questions;
     const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
 
-    // يوم جديد - نصفّر العداد اليومي
     if (lastDate !== today) {
       dailyCount = 0;
     }
@@ -102,19 +133,16 @@ async function checkUserAccess(phone) {
       return { allowed: false, reason: 'daily_limit' };
     }
 
-    // نزيد العداد اليومي
     await pool.query(
       'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
       [dailyCount + 1, today, phone]
     );
     return { allowed: true };
   } else {
-    // غير مشترك - نتحقق من الأسئلة المجانية
     if (user.free_questions_used >= FREE_LIMIT) {
       return { allowed: false, reason: 'free_limit' };
     }
 
-    // نزيد عداد الأسئلة المجانية
     await pool.query(
       'UPDATE users SET free_questions_used = free_questions_used + 1 WHERE phone = $1',
       [phone]
@@ -357,11 +385,6 @@ const SYSTEM_INSTRUCTIONS = `أنت مساعد قانوني كويتي ودود 
 
 [خلاصة الرد]
 
-👋 الرد على السلام:
-
-و عليكم السلام و رحمة الله وبركاته 👋
-ياهلا أنا هنا أساعدك في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.
-
 👤 الرد على "منو سواك":
 
 مطورني:
@@ -415,6 +438,12 @@ app.post('/webhook', async (req, res) => {
     const text = message.text?.body;
     if (!text) return;
 
+    // إذا كانت الرسالة تحية أو رد قصير - رد محلي بدون احتساب أو استدعاء Claude
+    if (isGreeting(text) && !WHITELIST.includes(from)) {
+      await sendMessage(from, getGreetingReply(text));
+      return;
+    }
+
     // التحقق من صلاحية المستخدم
     const access = await checkUserAccess(from);
 
@@ -451,7 +480,6 @@ app.post('/webhook', async (req, res) => {
 
     let reply = response.content[0].text;
     
-    // تنظيف نهائي من رموز Markdown
     reply = reply.replace(/^#{1,6}\s+/gm, '');
     reply = reply.replace(/\*\*([^*]+)\*\*/g, '$1');
     reply = reply.replace(/__([^_]+)__/g, '$1');
