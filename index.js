@@ -47,8 +47,10 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-const FREE_LIMIT = 2;
-const DAILY_LIMIT = 10;
+// 🆕 New monetization tiers:
+const INITIAL_FREE_LIMIT = 6;     // Lifetime initial free questions for new users
+const DAILY_FREE_LIMIT = 2;       // Daily free questions after initial 6 consumed
+const DAILY_PAID_LIMIT = 10;      // Daily limit for paid subscribers
 
 const GREETINGS = [
   'السلام عليكم', 'سلام عليكم', 'السلام', 'مرحبا', 'مرحبتين', 'هلا', 'هلو',
@@ -94,6 +96,7 @@ async function checkUserAccess(phone) {
   const today = getKuwaitDate();
   let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
 
+  // 🆕 New user — first question counts toward initial 6
   if (result.rows.length === 0) {
     await pool.query(
       'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 0, $2)',
@@ -104,28 +107,40 @@ async function checkUserAccess(phone) {
 
   const user = result.rows[0];
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
+  const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
 
+  // 💎 PAID SUBSCRIBER PATH — 10 questions per day
   if (isSubscribed) {
-    let dailyCount = user.daily_questions;
-    const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
-    if (lastDate !== today) dailyCount = 0;
-
-    if (dailyCount >= DAILY_LIMIT) return { allowed: false, reason: 'daily_limit' };
-
+    let dailyCount = (lastDate === today) ? user.daily_questions : 0;
+    if (dailyCount >= DAILY_PAID_LIMIT) {
+      return { allowed: false, reason: 'daily_limit_paid' };
+    }
     await pool.query(
       'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
       [dailyCount + 1, today, phone]
     );
     return { allowed: true };
-  } else {
-    if (user.free_questions_used >= FREE_LIMIT) return { allowed: false, reason: 'free_limit' };
+  }
 
+  // 🆕 FREE USER — Phase 1: Use initial 6 lifetime questions
+  if (user.free_questions_used < INITIAL_FREE_LIMIT) {
     await pool.query(
-      'UPDATE users SET free_questions_used = free_questions_used + 1 WHERE phone = $1',
-      [phone]
+      'UPDATE users SET free_questions_used = free_questions_used + 1, last_question_date = $1 WHERE phone = $2',
+      [today, phone]
     );
     return { allowed: true };
   }
+
+  // 📅 FREE USER — Phase 2: Initial 6 done, daily 2 limit applies
+  let dailyCount = (lastDate === today) ? user.daily_questions : 0;
+  if (dailyCount >= DAILY_FREE_LIMIT) {
+    return { allowed: false, reason: 'daily_free_limit' };
+  }
+  await pool.query(
+    'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+    [dailyCount + 1, today, phone]
+  );
+  return { allowed: true };
 }
 
 const SYSTEM_INSTRUCTIONS = `أنت "تعاوني" - مساعد كويتي ودود متخصص في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.
@@ -375,10 +390,18 @@ app.post('/webhook', async (req, res) => {
 
     const access = await checkUserAccess(from);
     if (!access.allowed) {
-      if (access.reason === 'free_limit') {
-        await sendMessage(from, 'انتهت أسئلتك المجانية 🔒\n\nللاستمرار والحصول على أسئلة يومية، يرجى الاشتراك.\n\nللاشتراك تواصل معنا.');
-      } else if (access.reason === 'daily_limit') {
-        await sendMessage(from, 'وصلت الحد اليومي ⏰\n\nتقدر تسأل من جديد بكرا. شكراً لك 🌟');
+      // 🆕 Updated blocking messages for new monetization tiers
+      if (access.reason === 'daily_free_limit') {
+        await sendMessage(from,
+          'خلصت الأجوبة المجانية اليوم 🔒\n\n' +
+          'تقدر تسأل من جديد بكرا، أو تشترك بالباقة المدفوعة للحصول على 10 أسئلة يومياً.\n\n' +
+          'للاشتراك تواصل معنا.'
+        );
+      } else if (access.reason === 'daily_limit_paid') {
+        await sendMessage(from,
+          'وصلت الحد اليومي ⏰\n\n' +
+          'تقدر تسأل من جديد بكرا. شكراً لك 🌟'
+        );
       }
       return;
     }
