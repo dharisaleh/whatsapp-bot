@@ -47,10 +47,10 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
-// 🆕 New monetization tiers:
-const INITIAL_FREE_LIMIT = 6;     // Lifetime initial free questions for new users
-const DAILY_FREE_LIMIT = 2;       // Daily free questions after initial 6 consumed
-const DAILY_PAID_LIMIT = 10;      // Daily limit for paid subscribers
+// 🆕 خطة الأسئلة المجانية المعدّلة
+const TOTAL_FREE_LIMIT = 6;       // الحد الأقصى المجاني للأبد (إجمالي)
+const DAILY_FREE_LIMIT = 2;       // الحد اليومي للمستخدم المجاني
+const DAILY_PAID_LIMIT = 10;      // الحد اليومي للمشترك المدفوع
 
 const GREETINGS = [
   'السلام عليكم', 'سلام عليكم', 'السلام', 'مرحبا', 'مرحبتين', 'هلا', 'هلو',
@@ -96,10 +96,10 @@ async function checkUserAccess(phone) {
   const today = getKuwaitDate();
   let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
 
-  // 🆕 New user — first question counts toward initial 6
+  // 🆕 مستخدم جديد - السؤال الأول
   if (result.rows.length === 0) {
     await pool.query(
-      'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 0, $2)',
+      'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 1, $2)',
       [phone, today]
     );
     return { allowed: true };
@@ -109,7 +109,7 @@ async function checkUserAccess(phone) {
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
   const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
 
-  // 💎 PAID SUBSCRIBER PATH — 10 questions per day
+  // 💎 المشترك المدفوع - 10 يومياً
   if (isSubscribed) {
     let dailyCount = (lastDate === today) ? user.daily_questions : 0;
     if (dailyCount >= DAILY_PAID_LIMIT) {
@@ -122,22 +122,22 @@ async function checkUserAccess(phone) {
     return { allowed: true };
   }
 
-  // 🆕 FREE USER — Phase 1: Use initial 6 lifetime questions
-  if (user.free_questions_used < INITIAL_FREE_LIMIT) {
-    await pool.query(
-      'UPDATE users SET free_questions_used = free_questions_used + 1, last_question_date = $1 WHERE phone = $2',
-      [today, phone]
-    );
-    return { allowed: true };
+  // 🆓 المستخدم المجاني
+
+  // فحص 1: هل خلّص الـ 6 الكلية؟
+  if (user.free_questions_used >= TOTAL_FREE_LIMIT) {
+    return { allowed: false, reason: 'total_free_exhausted' };
   }
 
-  // 📅 FREE USER — Phase 2: Initial 6 done, daily 2 limit applies
+  // فحص 2: هل خلّص الـ 2 اليومية؟
   let dailyCount = (lastDate === today) ? user.daily_questions : 0;
   if (dailyCount >= DAILY_FREE_LIMIT) {
     return { allowed: false, reason: 'daily_free_limit' };
   }
+
+  // مسموح - زود العدّادين (الكلي + اليومي)
   await pool.query(
-    'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+    'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
     [dailyCount + 1, today, phone]
   );
   return { allowed: true };
@@ -390,14 +390,23 @@ app.post('/webhook', async (req, res) => {
 
     const access = await checkUserAccess(from);
     if (!access.allowed) {
-      // 🆕 Updated blocking messages for new monetization tiers
+      // 🆕 ثلاث رسائل حظر مختلفة بحسب الحالة
       if (access.reason === 'daily_free_limit') {
+        // استهلك 2 اليوم، عنده باقي من الـ 6 الكلية
         await sendMessage(from,
-          'خلصت الأجوبة المجانية اليوم 🔒\n\n' +
-          'تقدر تسأل من جديد بكرا، أو تشترك بالباقة المدفوعة للحصول على 10 أسئلة يومياً.\n\n' +
+          'خلصت أسئلتك المجانية لهذا اليوم 🔒\n\n' +
+          'تقدر تسأل من جديد بكرا، أو تشترك بالباقة المدفوعة الآن للحصول على 10 أسئلة يومياً بدون انتظار.\n\n' +
+          'للاشتراك تواصل معنا.'
+        );
+      } else if (access.reason === 'total_free_exhausted') {
+        // خلّص كل الـ 6 الكلية
+        await sendMessage(from,
+          'خلصت أسئلتك المجانية 🔒\n\n' +
+          'للاستمرار يرجى الاشتراك بالباقة المدفوعة للحصول على 10 أسئلة يومياً.\n\n' +
           'للاشتراك تواصل معنا.'
         );
       } else if (access.reason === 'daily_limit_paid') {
+        // مشترك مدفوع وصل الـ 10 يومياً
         await sendMessage(from,
           'وصلت الحد اليومي ⏰\n\n' +
           'تقدر تسأل من جديد بكرا. شكراً لك 🌟'
