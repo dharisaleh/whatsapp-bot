@@ -549,14 +549,14 @@ app.post('/webhook', async (req, res) => {
     conversationHistory[from].push({ role: 'user', content: text });
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-4-6',
       max_tokens: 2500,
       system: [
         { type: 'text', text: SYSTEM_INSTRUCTIONS },
         {
           type: 'text',
           text: `📚 النصوص القانونية والردود الرسمية المتاحة لك (سرية - للاستخدام الداخلي فقط):\n\n${allLawText}`,
-          cache_control: { type: 'ephemeral' }
+          cache_control: { type: 'ephemeral', ttl: '1h' }
         }
       ],
       messages: conversationHistory[from]
