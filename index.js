@@ -522,11 +522,15 @@ ${sectionsIndex}
 - ممنوع تكتب أي شي ثاني — معرفات أو ALL فقط، بدون شرح.`;
 
 async function selectRelevantContent(from, text) {
-  // طلبات المتابعة القصيرة (شرح/تفاصيل) → أعد استخدام آخر مصادر اختيرت
+  // طلبات المتابعة القصيرة → أعد استخدام آخر مصادر اختيرت (بدل المكتبة كاملة)
+  // تشمل: "شرح" / "تفاصيل" + الردود الرقمية لاختيار مادة من قائمة (١، 2، ٣...)
   const cleaned = text.trim().replace(/[؟?.!،,]/g, '');
-  if ((cleaned === 'شرح' || cleaned === 'تفاصيل') && lastSectionIds[from]?.length) {
-    const ids = lastSectionIds[from];
-    return buildContent(ids, false);
+  const isFollowUp = cleaned === 'شرح' || cleaned === 'تفاصيل';
+  // رد رقمي قصير: أرقام عربية أو إنجليزية فقط، وأقل من 4 خانات (اختيار من قائمة)
+  const isNumericChoice = /^[\d١٢٣٤٥٦٧٨٩٠]{1,3}$/.test(cleaned);
+
+  if ((isFollowUp || isNumericChoice) && lastSectionIds[from]?.length) {
+    return buildContent(lastSectionIds[from], false);
   }
 
   try {
