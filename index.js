@@ -657,6 +657,15 @@ app.post('/webhook', async (req, res) => {
       messages: conversationHistory[from]
     });
 
+    // التوكن الحقيقي من الـAPI (بعد رد الموديل) — للمراقبة الفعلية للصرف بـRailway
+    const u = response.usage || {};
+    console.log(
+      `Tokens → input: ${u.input_tokens ?? 0}` +
+      ` | output: ${u.output_tokens ?? 0}` +
+      ` | cache write: ${u.cache_creation_input_tokens ?? 0}` +
+      ` | cache read: ${u.cache_read_input_tokens ?? 0}`
+    );
+
     let reply = response.content[0].text;
     // تنظيف رموز التنسيق
     reply = reply.replace(/^#{1,6}\s+/gm, '');
