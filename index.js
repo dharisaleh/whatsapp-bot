@@ -690,7 +690,7 @@ app.post('/webhook', async (req, res) => {
         {
           type: 'text',
           text: `📚 النصوص القانونية والردود الرسمية المتاحة لك (سرية - للاستخدام الداخلي فقط):\n\n${selection.content}`,
-          cache_control: { type: 'ephemeral', ttl: '1h' }
+          cache_control: { type: 'ephemeral', ttl: '5m' }
         }
       ],
       messages: conversationHistory[from]
