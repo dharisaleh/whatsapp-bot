@@ -69,34 +69,77 @@ const TOTAL_FREE_LIMIT = 6;       // الحد الأقصى المجاني الإ
 const DAILY_FREE_LIMIT = 2;       // الحد اليومي للمستخدم المجاني (FREE_LIMIT=2)
 const DAILY_PAID_LIMIT = 10;      // الحد اليومي للمشترك المدفوع (DAILY_LIMIT=10)
 
-const GREETINGS = [
-  'السلام عليكم', 'سلام عليكم', 'السلام', 'مرحبا', 'مرحبتين', 'هلا', 'هلو',
-  'هاي', 'اهلا', 'أهلا', 'صباح الخير', 'مساء الخير', 'صباح النور', 'مساء النور',
-  'شكرا', 'شكراً', 'تسلم', 'يعطيك العافية', 'مشكور', 'ثانكس', 'تسلمين',
-  'اوك', 'أوك', 'تمام', 'زين', 'طيب', 'ماشي', 'اوكي', 'حياك',
-  'مع السلامة', 'باي', 'وعليكم السلام'
-];
+// ===== تعديل 35: ردود ثابتة (تحيات + هوية + مطوّر) — صفر تكلفة API =====
 
-function isGreeting(text) {
-  const cleaned = text.trim().replace(/[؟?.!،,]/g, '').toLowerCase();
-  if (cleaned.length <= 25) {
-    return GREETINGS.some(g => cleaned === g || cleaned === g.replace(/[أإآ]/g, 'ا'));
-  }
-  return false;
+// تنظيف النص: حذف علامات الترقيم والتشكيل وتوحيد الهمزات
+function normalizeText(text) {
+  return text
+    .trim()
+    .replace(/[؟?.!،,;:\-_"']/g, '')
+    .replace(/[\u064B-\u0652]/g, '')   // حذف التشكيل
+    .replace(/[أإآ]/g, 'ا')            // توحيد الهمزات
+    .replace(/ى/g, 'ي')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function getGreetingReply(text) {
-  const cleaned = text.trim().replace(/[؟?.!،,]/g, '');
-  if (cleaned.includes('سلام')) {
-    return 'وعليكم السلام ورحمة الله وبركاته\nأنا اسمي تعاوني 👋\nشلون أقدر أساعدك؟';
+// كل مجموعة: عبارات → رد ثابت واحد
+const FIXED_REPLIES = [
+  {
+    phrases: ['هلا', 'هلا والله', 'هلا بك', 'هلو', 'مرحبا', 'مرحبتين', 'هاي', 'اهلا', 'اهلين'],
+    reply: 'هلا فيك 🌟'
+  },
+  {
+    phrases: ['السلام عليكم', 'سلام عليكم', 'السلام', 'سلام', 'السلام عليكم ورحمة الله', 'السلام عليكم ورحمة الله وبركاته'],
+    reply: 'وعليكم السلام ورحمة الله وبركاته'
+  },
+  {
+    phrases: ['صباح الخير', 'صباحك الله بالخير', 'صباح النور'],
+    reply: 'صباح النور 🌤️'
+  },
+  {
+    phrases: ['مساء الخير', 'مساك الله بالخير', 'مساء النور'],
+    reply: 'مساء النور 🌙'
+  },
+  {
+    phrases: ['شلونك', 'شلونج', 'اشلونك', 'شخبارك', 'شخبارج', 'علومك', 'شلونك شخبارك'],
+    reply: 'الحمدلله تمام، انت شلونك؟'
+  },
+  {
+    phrases: ['تسلم', 'تسلمين', 'شكرا', 'مشكور', 'مشكورين', 'ثانكس'],
+    reply: 'العفو، حياك الله 🌹'
+  },
+  {
+    phrases: ['يعطيك العافية', 'عساك عالقوة', 'الله يعطيك العافية'],
+    reply: 'الله يعافيك 🌹'
+  },
+  {
+    phrases: ['مع السلامة', 'باي', 'في امان الله'],
+    reply: 'مع السلامة 👋'
+  },
+  {
+    phrases: ['اوك', 'اوكي', 'تمام', 'زين', 'طيب', 'ماشي', 'حياك'],
+    reply: 'حياك الله 🌟'
+  },
+  {
+    phrases: ['انت منو', 'منو انت', 'شنو انت', 'وش انت', 'من انت', 'عرف نفسك', 'شنو اسمك', 'شنو تسوي', 'شنو شغلك', 'شنو تقدر تسوي', 'شنو تعرف تسوي', 'وش تقدر تسوي', 'شلون تساعدني', 'شنو خدماتك'],
+    reply: 'أنا مستشارك تعاوني 🤝 تفضل بسؤالك'
+  },
+  {
+    phrases: ['منو سواك', 'منو صممك', 'منو برمجك', 'منو وراك', 'منو ورا هالبوت', 'شركة منو', 'منو طورك', 'من المطور', 'مين سواك', 'مين صممك', 'مين طورك'],
+    reply: 'طورني المستشار التعاوني ضاري عادل احمد بالتعاون مع عدة شركات متخصصة 🤝'
   }
-  if (cleaned.includes('شكر') || cleaned.includes('تسلم') || cleaned.includes('العافية') || cleaned.includes('مشكور') || cleaned.includes('ثانكس')) {
-    return 'الله يحفظك 🌟 أي وقت تحتاج مساعدة أنا حاضر.';
+];
+
+// يرجع الرد الثابت لو الرسالة تطابق عبارة، وإلا null
+function getFixedReply(text) {
+  const cleaned = normalizeText(text);
+  for (const group of FIXED_REPLIES) {
+    if (group.phrases.some(p => normalizeText(p) === cleaned)) {
+      return group.reply;
+    }
   }
-  if (cleaned.includes('سلامة') || cleaned.includes('باي')) {
-    return 'مع السلامة 👋 في أمان الله.';
-  }
-  return 'هلا والله\nأنا اسمي تعاوني 👋\nشلون أقدر أساعدك؟';
+  return null;
 }
 
 function getKuwaitDate() {
@@ -659,8 +702,10 @@ app.post('/webhook', async (req, res) => {
     const text = message.text?.body;
     if (!text) return;
 
-    if (isGreeting(text) && !WHITELIST.includes(from)) {
-      await sendMessage(from, getGreetingReply(text));
+    // تعديل 35: رد ثابت فوري — قبل العدّادات والراوتر والتاريخ (صفر تكلفة)
+    const fixedReply = getFixedReply(text);
+    if (fixedReply) {
+      await sendMessage(from, fixedReply);
       return;
     }
 
