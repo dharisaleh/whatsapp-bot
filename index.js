@@ -148,38 +148,33 @@ function getKuwaitDate() {
   return kuwaitTime.toISOString().split('T')[0];
 }
 
+// يتحقق فقط من صلاحية المستخدم بدون تعديل العدّادات.
+// العدّاد لا يُحسب إلا بعد نجاح الرد فعلياً عبر recordQuestion().
+// هكذا لو فشل الاتصال بالـAPI لا يُحسب على المستخدم سؤال مقابل لا شيء.
 async function checkUserAccess(phone) {
   if (WHITELIST.includes(phone)) {
-    return { allowed: true };
+    return { allowed: true, record: null };
   }
 
   const today = getKuwaitDate();
-  let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+  const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
 
-  // مستخدم جديد - السؤال الأول
+  // مستخدم جديد - السؤال الأول (الإدراج يتم بعد نجاح الرد)
   if (result.rows.length === 0) {
-    await pool.query(
-      'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 1, $2)',
-      [phone, today]
-    );
-    return { allowed: true };
+    return { allowed: true, record: { type: 'new', today } };
   }
 
   const user = result.rows[0];
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
   const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
+  const dailyCount = (lastDate === today) ? user.daily_questions : 0;
 
   // المشترك المدفوع - 10 يومياً
   if (isSubscribed) {
-    let dailyCount = (lastDate === today) ? user.daily_questions : 0;
     if (dailyCount >= DAILY_PAID_LIMIT) {
       return { allowed: false, reason: 'daily_limit_paid' };
     }
-    await pool.query(
-      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-      [dailyCount + 1, today, phone]
-    );
-    return { allowed: true };
+    return { allowed: true, record: { type: 'paid', dailyCount, today } };
   }
 
   // المستخدم المجاني
@@ -190,17 +185,41 @@ async function checkUserAccess(phone) {
   }
 
   // فحص 2: هل خلّص الـ 2 اليومية؟
-  let dailyCount = (lastDate === today) ? user.daily_questions : 0;
   if (dailyCount >= DAILY_FREE_LIMIT) {
     return { allowed: false, reason: 'daily_free_limit' };
   }
 
-  // مسموح - زود العدّادين (الكلي + اليومي)
-  await pool.query(
-    'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-    [dailyCount + 1, today, phone]
-  );
-  return { allowed: true };
+  return { allowed: true, record: { type: 'free', dailyCount, today } };
+}
+
+// يحسب السؤال فعلياً (يزيد العدّادات) — يُستدعى فقط بعد نجاح الرد.
+// ON CONFLICT يحمي من تسابق رسالتين متزامنتين لمستخدم جديد.
+async function recordQuestion(phone, record) {
+  if (!record) return; // قائمة بيضاء — لا يُحسب
+  const { type, today, dailyCount } = record;
+
+  if (type === 'new') {
+    await pool.query(
+      `INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date)
+       VALUES ($1, 1, 1, $2)
+       ON CONFLICT (phone) DO UPDATE SET
+         free_questions_used = users.free_questions_used + 1,
+         daily_questions = CASE WHEN users.last_question_date = $2
+                                THEN users.daily_questions + 1 ELSE 1 END,
+         last_question_date = $2`,
+      [phone, today]
+    );
+  } else if (type === 'paid') {
+    await pool.query(
+      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+      [dailyCount + 1, today, phone]
+    );
+  } else { // free
+    await pool.query(
+      'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+      [dailyCount + 1, today, phone]
+    );
+  }
 }
 
 const SYSTEM_INSTRUCTIONS = `أنت "تعاوني" - مساعد كويتي ودود متخصص في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.
@@ -795,6 +814,24 @@ function buildContent(ids, usedFallback) {
   return { content, ids, usedFallback };
 }
 
+// ============ منع تكرار الرسائل (WhatsApp Webhook Retry) ============
+// واتساب يعيد إرسال نفس الرسالة أحياناً عند عدم استلام ACK بسرعة.
+// نحفظ معرّفات الرسائل المعالَجة مؤقتاً لتجاهل المكرر (رد مزدوج / حسبة مزدوجة).
+const processedMessages = new Map(); // message.id → timestamp
+const MESSAGE_DEDUP_TTL = 10 * 60 * 1000; // 10 دقائق
+
+function isDuplicateMessage(id) {
+  if (!id) return false;
+  const now = Date.now();
+  // تنظيف المعرّفات القديمة لمنع نمو الذاكرة
+  for (const [mid, ts] of processedMessages) {
+    if (now - ts > MESSAGE_DEDUP_TTL) processedMessages.delete(mid);
+  }
+  if (processedMessages.has(id)) return true;
+  processedMessages.set(id, now);
+  return false;
+}
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -808,13 +845,20 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+  let from;
   try {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
     if (!message) return;
-    const from = message.from;
+    from = message.from;
     const text = message.text?.body;
     if (!text) return;
+
+    // منع التكرار: لو واتساب أعاد إرسال نفس الرسالة نتجاهلها تماماً
+    if (isDuplicateMessage(message.id)) {
+      console.log(`Duplicate message ignored → ${message.id}`);
+      return;
+    }
 
     // تعديل 35: رد ثابت فوري — قبل العدّادات والراوتر والتاريخ (صفر تكلفة)
     const fixedReply = getFixedReply(text);
@@ -847,10 +891,10 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    if (!conversationHistory[from]) {
-      conversationHistory[from] = [];
-    }
-    conversationHistory[from].push({ role: 'user', content: text });
+    // نبني رسائل الطلب بإضافة السؤال الحالي، لكن لا نثبّته في السجل
+    // إلا بعد نجاح الرد — حتى لا يفسد السجل (رسالتا user متتاليتان) عند الفشل.
+    const history = conversationHistory[from] || [];
+    const messagesForApi = [...history, { role: 'user', content: text }];
 
     // التوجيه: نجيب المصادر المتعلقة بالسؤال فقط (مع شبكة أمان للمكتبة الكاملة)
     const selection = await selectRelevantContent(from, text);
@@ -872,7 +916,7 @@ app.post('/webhook', async (req, res) => {
           cache_control: { type: 'ephemeral', ttl: '5m' }
         }
       ],
-      messages: conversationHistory[from]
+      messages: messagesForApi
     });
     const response = await stream.finalMessage();
 
@@ -898,11 +942,15 @@ app.post('/webhook', async (req, res) => {
     // تنظيف الأسطر الفارغة الزائدة الناتجة عن الحذف
     reply = reply.replace(/\n{3,}/g, '\n\n').trim();
 
+    // نجح الرد → الآن فقط: نثبّت السجل، ونحسب السؤال على المستخدم
+    conversationHistory[from] = messagesForApi;
     conversationHistory[from].push({ role: 'assistant', content: reply });
 
     if (conversationHistory[from].length > 10) {
       conversationHistory[from] = conversationHistory[from].slice(-10);
     }
+
+    await recordQuestion(from, access.record);
 
     const chunks = splitMessage(reply, 3900);
     for (let i = 0; i < chunks.length; i++) {
@@ -913,6 +961,13 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
+    // نُعلم المستخدم بدل الصمت — ولم يُحسب عليه سؤال لأن recordQuestion لم يُستدعَ
+    if (from) {
+      await sendMessage(from,
+        'صار خطأ مؤقت من طرفنا 🙏\n\n' +
+        'ما انحسب عليك سؤال. جرّب ترسل سؤالك مرة ثانية بعد شوي.'
+      );
+    }
   }
 });
 
