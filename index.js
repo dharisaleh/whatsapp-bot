@@ -28,7 +28,21 @@ async function initDatabase() {
         last_question_date DATE
       )
     `);
-    console.log('Database table ready');
+    // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS questions_log (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(20),
+        question TEXT,
+        sources TEXT,
+        used_fallback BOOLEAN DEFAULT FALSE,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        rating VARCHAR(10),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('Database tables ready');
   } catch (error) {
     console.error('Database init error:', error.message);
   }
@@ -219,6 +233,38 @@ async function recordQuestion(phone, record) {
       'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
       [dailyCount + 1, today, phone]
     );
+  }
+}
+
+// يسجّل السؤال في جدول Analytics ويرجّع معرّفه (لربط التقييم به لاحقاً).
+// أي خطأ هنا لا يكسر الرد — نرجّع null فقط.
+async function logQuestion(phone, question, selection, usage) {
+  try {
+    const result = await pool.query(
+      `INSERT INTO questions_log (phone, question, sources, used_fallback, input_tokens, output_tokens)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [
+        phone,
+        question,
+        (selection.ids || []).join(','),
+        !!selection.usedFallback,
+        usage.input_tokens ?? 0,
+        usage.output_tokens ?? 0
+      ]
+    );
+    return result.rows[0]?.id ?? null;
+  } catch (error) {
+    console.error('logQuestion error:', error.message);
+    return null;
+  }
+}
+
+// يخزّن تقييم المستخدم (👍/👎) للسؤال المحدد.
+async function recordFeedback(questionId, rating) {
+  try {
+    await pool.query('UPDATE questions_log SET rating = $1 WHERE id = $2', [rating, questionId]);
+  } catch (error) {
+    console.error('recordFeedback error:', error.message);
   }
 }
 
@@ -843,6 +889,12 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// رسالة ترحيب لأول تواصل من رقم جديد — تعريف بالبوت والباقة المجانية
+const WELCOME_MESSAGE =
+  'أهلاً وسهلاً 👋\n\n' +
+  'أنا "تعاوني" — مساعدك للأسئلة عن قوانين وقرارات العمل التعاوني والعمل في الكويت.\n\n' +
+  `عندك ${TOTAL_FREE_LIMIT} أسئلة مجانية (بحد ${DAILY_FREE_LIMIT} يومياً). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚`;
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   let from;
@@ -851,14 +903,22 @@ app.post('/webhook', async (req, res) => {
     const message = entry?.messages?.[0];
     if (!message) return;
     from = message.from;
-    const text = message.text?.body;
-    if (!text) return;
 
-    // منع التكرار: لو واتساب أعاد إرسال نفس الرسالة نتجاهلها تماماً
+    // منع التكرار أولاً — يشمل النص وردود الأزرار (webhook retry)
     if (isDuplicateMessage(message.id)) {
       console.log(`Duplicate message ignored → ${message.id}`);
       return;
     }
+
+    // رد زر التقييم (👍/👎): نخزّنه ونخرج — لا يُحسب سؤالاً ولا يذهب للموديل
+    const buttonId = message.interactive?.button_reply?.id;
+    if (buttonId?.startsWith('fb_')) {
+      await handleFeedback(from, buttonId);
+      return;
+    }
+
+    const text = message.text?.body;
+    if (!text) return;
 
     // تعديل 35: رد ثابت فوري — قبل العدّادات والراوتر والتاريخ (صفر تكلفة)
     const fixedReply = getFixedReply(text);
@@ -890,6 +950,14 @@ app.post('/webhook', async (req, res) => {
       }
       return;
     }
+
+    // أول رسالة من رقم جديد → رسالة ترحيب تعريفية قبل الجواب
+    if (access.record?.type === 'new') {
+      await sendMessage(from, WELCOME_MESSAGE);
+    }
+
+    // نعلّم رسالة المستخدم كمقروءة ونظهر "يكتب الآن…" أثناء تجهيز الرد
+    markAsReadWithTyping(message.id);
 
     // نبني رسائل الطلب بإضافة السؤال الحالي، لكن لا نثبّته في السجل
     // إلا بعد نجاح الرد — حتى لا يفسد السجل (رسالتا user متتاليتان) عند الفشل.
@@ -952,6 +1020,9 @@ app.post('/webhook', async (req, res) => {
 
     await recordQuestion(from, access.record);
 
+    // Analytics: نسجّل السؤال ونرجّع معرّفه لربط التقييم به
+    const questionId = await logQuestion(from, text, selection, u);
+
     const chunks = splitMessage(reply, 3900);
     for (let i = 0; i < chunks.length; i++) {
       await sendMessage(from, chunks[i]);
@@ -959,6 +1030,9 @@ app.post('/webhook', async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
+
+    // أزرار تقييم الرد (👍/👎) بعد وصول الجواب كاملاً
+    await sendFeedbackButtons(from, questionId);
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
     // نُعلم المستخدم بدل الصمت — ولم يُحسب عليه سؤال لأن recordQuestion لم يُستدعَ
@@ -1012,6 +1086,64 @@ async function sendMessage(to, text) {
   } catch (error) {
     console.error('Send error:', error.response?.data || error.message);
   }
+}
+
+// يعلّم رسالة المستخدم كـ"مقروءة" ويُظهر مؤشّر "يكتب الآن…" — طمأنة أثناء تجهيز الرد.
+// المؤشّر يختفي تلقائياً عند إرسال أول رد أو بعد ~25 ثانية.
+async function markAsReadWithTyping(messageId) {
+  if (!messageId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: messageId,
+        typing_indicator: { type: 'text' }
+      },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('markAsRead error:', error.response?.data || error.message);
+  }
+}
+
+// يرسل أزرار تقييم الرد (👍/👎) مربوطة بمعرّف السؤال في جدول Analytics.
+async function sendFeedbackButtons(to, questionId) {
+  if (!questionId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { text: 'هل كان الجواب مفيد؟' },
+          action: {
+            buttons: [
+              { type: 'reply', reply: { id: `fb_up_${questionId}`, title: '👍 مفيد' } },
+              { type: 'reply', reply: { id: `fb_down_${questionId}`, title: '👎 غير مفيد' } }
+            ]
+          }
+        }
+      },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('sendFeedbackButtons error:', error.response?.data || error.message);
+  }
+}
+
+// يعالج ضغط زر التقييم: يستخرج التقييم ومعرّف السؤال من id الزر ويخزّنه.
+async function handleFeedback(from, buttonId) {
+  const rating = buttonId.startsWith('fb_up_') ? 'up' : 'down';
+  const questionId = parseInt(buttonId.replace(/^fb_(up|down)_/, ''), 10);
+  if (!Number.isNaN(questionId)) {
+    await recordFeedback(questionId, rating);
+  }
+  await sendMessage(from, rating === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏');
 }
 
 const PORT = process.env.PORT || 3000;
