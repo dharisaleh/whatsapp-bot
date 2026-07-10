@@ -270,6 +270,59 @@ async function recordFeedback(questionId, rating) {
   }
 }
 
+// يبني تقرير إحصائيات للمالك: إجمالي الأسئلة، التقييمات، ونشاط آخر ٢٤ ساعة،
+// مع آخر الأسئلة التي قُيّمت بـ 👎 لمراجعتها.
+async function buildStatsReport() {
+  try {
+    const totals = await pool.query(`
+      SELECT
+        COUNT(*)                                        AS total,
+        COUNT(*) FILTER (WHERE rating = 'up')           AS up,
+        COUNT(*) FILTER (WHERE rating = 'down')         AS down,
+        COUNT(*) FILTER (WHERE rating IS NULL)          AS none,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last24,
+        COUNT(*) FILTER (WHERE used_fallback)           AS fallback
+      FROM questions_log
+    `);
+    const t = totals.rows[0];
+
+    const bad = await pool.query(`
+      SELECT question FROM questions_log
+      WHERE rating = 'down'
+      ORDER BY created_at DESC
+      LIMIT 5
+    `);
+
+    const rated = Number(t.up) + Number(t.down);
+    const satisfaction = rated > 0 ? Math.round((Number(t.up) / rated) * 100) : null;
+
+    let report =
+      '📊 إحصائيات البوت\n\n' +
+      `📝 إجمالي الأسئلة: ${t.total}\n` +
+      `🕐 آخر ٢٤ ساعة: ${t.last24}\n\n` +
+      `👍 مفيد: ${t.up}\n` +
+      `👎 غير مفيد: ${t.down}\n` +
+      `⚪ بدون تقييم: ${t.none}\n`;
+
+    if (satisfaction !== null) {
+      report += `\n⭐ نسبة الرضا: ${satisfaction}% (من ${rated} تقييم)\n`;
+    }
+    report += `\n🔎 أسئلة بلا مصدر محدد (fallback): ${t.fallback}`;
+
+    if (bad.rows.length > 0) {
+      report += '\n\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
+      bad.rows.forEach((r, i) => {
+        const q = (r.question || '').slice(0, 80);
+        report += `${i + 1}. ${q}\n`;
+      });
+    }
+    return report;
+  } catch (error) {
+    console.error('buildStatsReport error:', error.message);
+    return 'تعذّر جلب الإحصائيات حالياً 🙏';
+  }
+}
+
 const SYSTEM_INSTRUCTIONS = `أنت "تعاوني" - مساعد كويتي ودود متخصص في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.
 
 🚨 قاعدة "رد واحد فقط - لا تدمج" (الأهم على الإطلاق) 🚨
@@ -914,6 +967,14 @@ app.post('/webhook', async (req, res) => {
 
     const text = message.text?.body;
     if (!text) return;
+
+    // أمر إداري للمالك فقط (WHITELIST): ملخص التقييمات والإحصائيات
+    const cmd = text.trim().replace(/^\//, '');
+    if (WHITELIST.includes(from) && (cmd === 'تقييمات' || cmd === 'احصائيات' || cmd === 'إحصائيات')) {
+      const report = await buildStatsReport();
+      await sendMessage(from, report);
+      return;
+    }
 
     // تقييم الرد بإيموجي (👍/👎): يُربط بآخر سؤال — لا يُحسب سؤالاً ولا يذهب للموديل
     const feedback = parseFeedbackEmoji(text);
