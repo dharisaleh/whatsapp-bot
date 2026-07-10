@@ -72,6 +72,8 @@ const VALID_SECTION_IDS = sectionsData.sections.map(s => s.id);
 const lastSectionIds = {};
 
 const conversationHistory = {};
+// آخر سؤال مُسجّل لكل مستخدم — لربط تقييمه (👍/👎) بالسؤال الصحيح
+const lastQuestionId = {};
 const WHITELIST = ['96555667373', '96596049491'];
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -910,15 +912,20 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // رد زر التقييم (👍/👎): نخزّنه ونخرج — لا يُحسب سؤالاً ولا يذهب للموديل
-    const buttonId = message.interactive?.button_reply?.id;
-    if (buttonId?.startsWith('fb_')) {
-      await handleFeedback(from, buttonId);
-      return;
-    }
-
     const text = message.text?.body;
     if (!text) return;
+
+    // تقييم الرد بإيموجي (👍/👎): يُربط بآخر سؤال — لا يُحسب سؤالاً ولا يذهب للموديل
+    const feedback = parseFeedbackEmoji(text);
+    if (feedback) {
+      const qid = lastQuestionId[from];
+      if (qid) {
+        await recordFeedback(qid, feedback);
+        delete lastQuestionId[from]; // تقييم واحد لكل سؤال
+        await sendMessage(from, feedback === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏');
+      }
+      return;
+    }
 
     // تعديل 35: رد ثابت فوري — قبل العدّادات والراوتر والتاريخ (صفر تكلفة)
     const fixedReply = getFixedReply(text);
@@ -1022,17 +1029,20 @@ app.post('/webhook', async (req, res) => {
 
     // Analytics: نسجّل السؤال ونرجّع معرّفه لربط التقييم به
     const questionId = await logQuestion(from, text, selection, u);
+    if (questionId) lastQuestionId[from] = questionId;
 
-    const chunks = splitMessage(reply, 3900);
+    // سطر تقييم صغير في نهاية الجواب (بدل الأزرار الكبيرة)
+    const replyToSend = questionId
+      ? reply + '\n\n— قيّم الجواب: أرسل 👍 أو 👎'
+      : reply;
+
+    const chunks = splitMessage(replyToSend, 3900);
     for (let i = 0; i < chunks.length; i++) {
       await sendMessage(from, chunks[i]);
       if (i < chunks.length - 1) {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
-
-    // أزرار تقييم الرد (👍/👎) بعد وصول الجواب كاملاً
-    await sendFeedbackButtons(from, questionId);
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
     // نُعلم المستخدم بدل الصمت — ولم يُحسب عليه سؤال لأن recordQuestion لم يُستدعَ
@@ -1108,42 +1118,14 @@ async function markAsReadWithTyping(messageId) {
   }
 }
 
-// يرسل أزرار تقييم الرد (👍/👎) مربوطة بمعرّف السؤال في جدول Analytics.
-async function sendFeedbackButtons(to, questionId) {
-  if (!questionId) return;
-  try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        to: to,
-        type: 'interactive',
-        interactive: {
-          type: 'button',
-          body: { text: 'هل كان الجواب مفيد؟' },
-          action: {
-            buttons: [
-              { type: 'reply', reply: { id: `fb_up_${questionId}`, title: '👍 مفيد' } },
-              { type: 'reply', reply: { id: `fb_down_${questionId}`, title: '👎 غير مفيد' } }
-            ]
-          }
-        }
-      },
-      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('sendFeedbackButtons error:', error.response?.data || error.message);
-  }
-}
-
-// يعالج ضغط زر التقييم: يستخرج التقييم ومعرّف السؤال من id الزر ويخزّنه.
-async function handleFeedback(from, buttonId) {
-  const rating = buttonId.startsWith('fb_up_') ? 'up' : 'down';
-  const questionId = parseInt(buttonId.replace(/^fb_(up|down)_/, ''), 10);
-  if (!Number.isNaN(questionId)) {
-    await recordFeedback(questionId, rating);
-  }
-  await sendMessage(from, rating === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏');
+// يكشف إن كانت رسالة المستخدم تقييماً (👍/👎) لآخر جواب.
+// يُشترط أن تكون قصيرة (إيموجي فقط) حتى لا نخلط سؤالاً يحوي إيموجي بالتقييم.
+function parseFeedbackEmoji(text) {
+  const t = text.trim();
+  if ([...t].length > 3) return null; // ليست إيموجي مفرد
+  if (t.includes('👍')) return 'up';
+  if (t.includes('👎')) return 'down';
+  return null;
 }
 
 const PORT = process.env.PORT || 3000;
