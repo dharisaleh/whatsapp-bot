@@ -28,7 +28,21 @@ async function initDatabase() {
         last_question_date DATE
       )
     `);
-    console.log('Database table ready');
+    // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS questions_log (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(20),
+        question TEXT,
+        sources TEXT,
+        used_fallback BOOLEAN DEFAULT FALSE,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        rating VARCHAR(10),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('Database tables ready');
   } catch (error) {
     console.error('Database init error:', error.message);
   }
@@ -148,38 +162,33 @@ function getKuwaitDate() {
   return kuwaitTime.toISOString().split('T')[0];
 }
 
+// يتحقق فقط من صلاحية المستخدم بدون تعديل العدّادات.
+// العدّاد لا يُحسب إلا بعد نجاح الرد فعلياً عبر recordQuestion().
+// هكذا لو فشل الاتصال بالـAPI لا يُحسب على المستخدم سؤال مقابل لا شيء.
 async function checkUserAccess(phone) {
   if (WHITELIST.includes(phone)) {
-    return { allowed: true };
+    return { allowed: true, record: null };
   }
 
   const today = getKuwaitDate();
-  let result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+  const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
 
-  // مستخدم جديد - السؤال الأول
+  // مستخدم جديد - السؤال الأول (الإدراج يتم بعد نجاح الرد)
   if (result.rows.length === 0) {
-    await pool.query(
-      'INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date) VALUES ($1, 1, 1, $2)',
-      [phone, today]
-    );
-    return { allowed: true };
+    return { allowed: true, record: { type: 'new', today } };
   }
 
   const user = result.rows[0];
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
   const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
+  const dailyCount = (lastDate === today) ? user.daily_questions : 0;
 
   // المشترك المدفوع - 10 يومياً
   if (isSubscribed) {
-    let dailyCount = (lastDate === today) ? user.daily_questions : 0;
     if (dailyCount >= DAILY_PAID_LIMIT) {
       return { allowed: false, reason: 'daily_limit_paid' };
     }
-    await pool.query(
-      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-      [dailyCount + 1, today, phone]
-    );
-    return { allowed: true };
+    return { allowed: true, record: { type: 'paid', dailyCount, today } };
   }
 
   // المستخدم المجاني
@@ -190,17 +199,73 @@ async function checkUserAccess(phone) {
   }
 
   // فحص 2: هل خلّص الـ 2 اليومية؟
-  let dailyCount = (lastDate === today) ? user.daily_questions : 0;
   if (dailyCount >= DAILY_FREE_LIMIT) {
     return { allowed: false, reason: 'daily_free_limit' };
   }
 
-  // مسموح - زود العدّادين (الكلي + اليومي)
-  await pool.query(
-    'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-    [dailyCount + 1, today, phone]
-  );
-  return { allowed: true };
+  return { allowed: true, record: { type: 'free', dailyCount, today } };
+}
+
+// يحسب السؤال فعلياً (يزيد العدّادات) — يُستدعى فقط بعد نجاح الرد.
+// ON CONFLICT يحمي من تسابق رسالتين متزامنتين لمستخدم جديد.
+async function recordQuestion(phone, record) {
+  if (!record) return; // قائمة بيضاء — لا يُحسب
+  const { type, today, dailyCount } = record;
+
+  if (type === 'new') {
+    await pool.query(
+      `INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date)
+       VALUES ($1, 1, 1, $2)
+       ON CONFLICT (phone) DO UPDATE SET
+         free_questions_used = users.free_questions_used + 1,
+         daily_questions = CASE WHEN users.last_question_date = $2
+                                THEN users.daily_questions + 1 ELSE 1 END,
+         last_question_date = $2`,
+      [phone, today]
+    );
+  } else if (type === 'paid') {
+    await pool.query(
+      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+      [dailyCount + 1, today, phone]
+    );
+  } else { // free
+    await pool.query(
+      'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
+      [dailyCount + 1, today, phone]
+    );
+  }
+}
+
+// يسجّل السؤال في جدول Analytics ويرجّع معرّفه (لربط التقييم به لاحقاً).
+// أي خطأ هنا لا يكسر الرد — نرجّع null فقط.
+async function logQuestion(phone, question, selection, usage) {
+  try {
+    const result = await pool.query(
+      `INSERT INTO questions_log (phone, question, sources, used_fallback, input_tokens, output_tokens)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [
+        phone,
+        question,
+        (selection.ids || []).join(','),
+        !!selection.usedFallback,
+        usage.input_tokens ?? 0,
+        usage.output_tokens ?? 0
+      ]
+    );
+    return result.rows[0]?.id ?? null;
+  } catch (error) {
+    console.error('logQuestion error:', error.message);
+    return null;
+  }
+}
+
+// يخزّن تقييم المستخدم (👍/👎) للسؤال المحدد.
+async function recordFeedback(questionId, rating) {
+  try {
+    await pool.query('UPDATE questions_log SET rating = $1 WHERE id = $2', [rating, questionId]);
+  } catch (error) {
+    console.error('recordFeedback error:', error.message);
+  }
 }
 
 const SYSTEM_INSTRUCTIONS = `أنت "تعاوني" - مساعد كويتي ودود متخصص في القوانين والقرارات الوزارية المنظمة للعمل التعاوني في الكويت.
@@ -795,6 +860,24 @@ function buildContent(ids, usedFallback) {
   return { content, ids, usedFallback };
 }
 
+// ============ منع تكرار الرسائل (WhatsApp Webhook Retry) ============
+// واتساب يعيد إرسال نفس الرسالة أحياناً عند عدم استلام ACK بسرعة.
+// نحفظ معرّفات الرسائل المعالَجة مؤقتاً لتجاهل المكرر (رد مزدوج / حسبة مزدوجة).
+const processedMessages = new Map(); // message.id → timestamp
+const MESSAGE_DEDUP_TTL = 10 * 60 * 1000; // 10 دقائق
+
+function isDuplicateMessage(id) {
+  if (!id) return false;
+  const now = Date.now();
+  // تنظيف المعرّفات القديمة لمنع نمو الذاكرة
+  for (const [mid, ts] of processedMessages) {
+    if (now - ts > MESSAGE_DEDUP_TTL) processedMessages.delete(mid);
+  }
+  if (processedMessages.has(id)) return true;
+  processedMessages.set(id, now);
+  return false;
+}
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -806,13 +889,34 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+// رسالة ترحيب لأول تواصل من رقم جديد — تعريف بالبوت والباقة المجانية
+const WELCOME_MESSAGE =
+  'أهلاً وسهلاً 👋\n\n' +
+  'أنا "تعاوني" — مساعدك للأسئلة عن قوانين وقرارات العمل التعاوني والعمل في الكويت.\n\n' +
+  `عندك ${TOTAL_FREE_LIMIT} أسئلة مجانية (بحد ${DAILY_FREE_LIMIT} يومياً). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚`;
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+  let from;
   try {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
     if (!message) return;
-    const from = message.from;
+    from = message.from;
+
+    // منع التكرار أولاً — يشمل النص وردود الأزرار (webhook retry)
+    if (isDuplicateMessage(message.id)) {
+      console.log(`Duplicate message ignored → ${message.id}`);
+      return;
+    }
+
+    // رد زر التقييم (👍/👎): نخزّنه ونخرج — لا يُحسب سؤالاً ولا يذهب للموديل
+    const buttonId = message.interactive?.button_reply?.id;
+    if (buttonId?.startsWith('fb_')) {
+      await handleFeedback(from, buttonId);
+      return;
+    }
+
     const text = message.text?.body;
     if (!text) return;
 
@@ -847,10 +951,18 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    if (!conversationHistory[from]) {
-      conversationHistory[from] = [];
+    // أول رسالة من رقم جديد → رسالة ترحيب تعريفية قبل الجواب
+    if (access.record?.type === 'new') {
+      await sendMessage(from, WELCOME_MESSAGE);
     }
-    conversationHistory[from].push({ role: 'user', content: text });
+
+    // نعلّم رسالة المستخدم كمقروءة ونظهر "يكتب الآن…" أثناء تجهيز الرد
+    markAsReadWithTyping(message.id);
+
+    // نبني رسائل الطلب بإضافة السؤال الحالي، لكن لا نثبّته في السجل
+    // إلا بعد نجاح الرد — حتى لا يفسد السجل (رسالتا user متتاليتان) عند الفشل.
+    const history = conversationHistory[from] || [];
+    const messagesForApi = [...history, { role: 'user', content: text }];
 
     // التوجيه: نجيب المصادر المتعلقة بالسؤال فقط (مع شبكة أمان للمكتبة الكاملة)
     const selection = await selectRelevantContent(from, text);
@@ -872,7 +984,7 @@ app.post('/webhook', async (req, res) => {
           cache_control: { type: 'ephemeral', ttl: '5m' }
         }
       ],
-      messages: conversationHistory[from]
+      messages: messagesForApi
     });
     const response = await stream.finalMessage();
 
@@ -898,11 +1010,18 @@ app.post('/webhook', async (req, res) => {
     // تنظيف الأسطر الفارغة الزائدة الناتجة عن الحذف
     reply = reply.replace(/\n{3,}/g, '\n\n').trim();
 
+    // نجح الرد → الآن فقط: نثبّت السجل، ونحسب السؤال على المستخدم
+    conversationHistory[from] = messagesForApi;
     conversationHistory[from].push({ role: 'assistant', content: reply });
 
     if (conversationHistory[from].length > 10) {
       conversationHistory[from] = conversationHistory[from].slice(-10);
     }
+
+    await recordQuestion(from, access.record);
+
+    // Analytics: نسجّل السؤال ونرجّع معرّفه لربط التقييم به
+    const questionId = await logQuestion(from, text, selection, u);
 
     const chunks = splitMessage(reply, 3900);
     for (let i = 0; i < chunks.length; i++) {
@@ -911,8 +1030,18 @@ app.post('/webhook', async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
+
+    // أزرار تقييم الرد (👍/👎) بعد وصول الجواب كاملاً
+    await sendFeedbackButtons(from, questionId);
   } catch (error) {
     console.error('Error:', error.response?.data || error.message);
+    // نُعلم المستخدم بدل الصمت — ولم يُحسب عليه سؤال لأن recordQuestion لم يُستدعَ
+    if (from) {
+      await sendMessage(from,
+        'صار خطأ مؤقت من طرفنا 🙏\n\n' +
+        'ما انحسب عليك سؤال. جرّب ترسل سؤالك مرة ثانية بعد شوي.'
+      );
+    }
   }
 });
 
@@ -957,6 +1086,64 @@ async function sendMessage(to, text) {
   } catch (error) {
     console.error('Send error:', error.response?.data || error.message);
   }
+}
+
+// يعلّم رسالة المستخدم كـ"مقروءة" ويُظهر مؤشّر "يكتب الآن…" — طمأنة أثناء تجهيز الرد.
+// المؤشّر يختفي تلقائياً عند إرسال أول رد أو بعد ~25 ثانية.
+async function markAsReadWithTyping(messageId) {
+  if (!messageId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: messageId,
+        typing_indicator: { type: 'text' }
+      },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('markAsRead error:', error.response?.data || error.message);
+  }
+}
+
+// يرسل أزرار تقييم الرد (👍/👎) مربوطة بمعرّف السؤال في جدول Analytics.
+async function sendFeedbackButtons(to, questionId) {
+  if (!questionId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { text: 'هل كان الجواب مفيد؟' },
+          action: {
+            buttons: [
+              { type: 'reply', reply: { id: `fb_up_${questionId}`, title: '👍 مفيد' } },
+              { type: 'reply', reply: { id: `fb_down_${questionId}`, title: '👎 غير مفيد' } }
+            ]
+          }
+        }
+      },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('sendFeedbackButtons error:', error.response?.data || error.message);
+  }
+}
+
+// يعالج ضغط زر التقييم: يستخرج التقييم ومعرّف السؤال من id الزر ويخزّنه.
+async function handleFeedback(from, buttonId) {
+  const rating = buttonId.startsWith('fb_up_') ? 'up' : 'down';
+  const questionId = parseInt(buttonId.replace(/^fb_(up|down)_/, ''), 10);
+  if (!Number.isNaN(questionId)) {
+    await recordFeedback(questionId, rating);
+  }
+  await sendMessage(from, rating === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏');
 }
 
 const PORT = process.env.PORT || 3000;
