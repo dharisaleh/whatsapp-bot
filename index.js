@@ -1045,7 +1045,9 @@ app.post('/webhook', async (req, res) => {
       model: 'claude-sonnet-4-6',
       max_tokens: 2500,
       system: [
-        { type: 'text', text: SYSTEM_INSTRUCTIONS },
+        // نقطة تخزين مستقلة للبرومبت الثابت → يُكيَّش عبر كل الأسئلة
+        // حتى لو تغيّر النص القانوني (يوفّر ~13.8k توكن على أسئلة المتابعة والمتقاربة)
+        { type: 'text', text: SYSTEM_INSTRUCTIONS, cache_control: { type: 'ephemeral', ttl: '5m' } },
         {
           type: 'text',
           text: `📚 النصوص القانونية والردود الرسمية المتاحة لك (سرية - للاستخدام الداخلي فقط):\n\n${selection.content}`,
