@@ -28,7 +28,7 @@ async function initDatabase() {
         last_question_date DATE
       )
     `);
-    // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم
+    // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم، والتكلفة
     await pool.query(`
       CREATE TABLE IF NOT EXISTS questions_log (
         id SERIAL PRIMARY KEY,
@@ -38,10 +38,15 @@ async function initDatabase() {
         used_fallback BOOLEAN DEFAULT FALSE,
         input_tokens INTEGER DEFAULT 0,
         output_tokens INTEGER DEFAULT 0,
+        cache_write INTEGER DEFAULT 0,
+        cache_read INTEGER DEFAULT 0,
         rating VARCHAR(10),
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
+    // للجداول المُنشأة سابقاً: نضيف أعمدة الكاش إن لم تكن موجودة
+    await pool.query(`ALTER TABLE questions_log ADD COLUMN IF NOT EXISTS cache_write INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE questions_log ADD COLUMN IF NOT EXISTS cache_read INTEGER DEFAULT 0`);
     console.log('Database tables ready');
   } catch (error) {
     console.error('Database init error:', error.message);
@@ -93,6 +98,25 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const TOTAL_FREE_LIMIT = 6;       // الحد الأقصى المجاني الإجمالي للأبد
 const DAILY_FREE_LIMIT = 2;       // الحد اليومي للمستخدم المجاني (FREE_LIMIT=2)
 const DAILY_PAID_LIMIT = 10;      // الحد اليومي للمشترك المدفوع (DAILY_LIMIT=10)
+
+// ===== أسعار موديل claude-sonnet-4-6 (دولار لكل مليون توكن) =====
+// عدّلها هنا فقط لو تغيّرت الأسعار.
+const PRICE_INPUT = 3.00;         // إدخال عادي
+const PRICE_OUTPUT = 15.00;       // إخراج
+const PRICE_CACHE_WRITE = 3.75;   // كتابة الكاش (1.25×)
+const PRICE_CACHE_READ = 0.30;    // قراءة الكاش (0.1×)
+const USD_TO_KWD = 0.307;         // تحويل الدولار لدينار كويتي
+
+// يحسب تكلفة مجموعة توكن بالدينار الكويتي
+function tokensCostKWD(inTok, outTok, cacheWrite, cacheRead) {
+  const usd = (
+    (inTok || 0) * PRICE_INPUT +
+    (outTok || 0) * PRICE_OUTPUT +
+    (cacheWrite || 0) * PRICE_CACHE_WRITE +
+    (cacheRead || 0) * PRICE_CACHE_READ
+  ) / 1_000_000;
+  return usd * USD_TO_KWD;
+}
 
 // ===== تعديل 35: ردود ثابتة (تحيات + هوية + مطوّر) — صفر تكلفة API =====
 
@@ -252,15 +276,17 @@ async function recordQuestion(phone, record) {
 async function logQuestion(phone, question, selection, usage) {
   try {
     const result = await pool.query(
-      `INSERT INTO questions_log (phone, question, sources, used_fallback, input_tokens, output_tokens)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      `INSERT INTO questions_log (phone, question, sources, used_fallback, input_tokens, output_tokens, cache_write, cache_read)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
       [
         phone,
         question,
         (selection.ids || []).join(','),
         !!selection.usedFallback,
         usage.input_tokens ?? 0,
-        usage.output_tokens ?? 0
+        usage.output_tokens ?? 0,
+        usage.cache_creation_input_tokens ?? 0,
+        usage.cache_read_input_tokens ?? 0
       ]
     );
     return result.rows[0]?.id ?? null;
@@ -290,10 +316,25 @@ async function buildStatsReport() {
         COUNT(*) FILTER (WHERE rating = 'down')         AS down,
         COUNT(*) FILTER (WHERE rating IS NULL)          AS none,
         COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last24,
-        COUNT(*) FILTER (WHERE used_fallback)           AS fallback
+        COUNT(*) FILTER (WHERE used_fallback)           AS fallback,
+        COALESCE(SUM(input_tokens), 0)                  AS in_tok,
+        COALESCE(SUM(output_tokens), 0)                 AS out_tok,
+        COALESCE(SUM(cache_write), 0)                   AS cw_tok,
+        COALESCE(SUM(cache_read), 0)                    AS cr_tok,
+        COALESCE(SUM(input_tokens)  FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'), 0) AS in24,
+        COALESCE(SUM(output_tokens) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'), 0) AS out24,
+        COALESCE(SUM(cache_write)   FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'), 0) AS cw24,
+        COALESCE(SUM(cache_read)    FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'), 0) AS cr24
       FROM questions_log
     `);
     const t = totals.rows[0];
+
+    // حساب التكلفة الفعلية بالدينار من التوكن المسجّل
+    const totalCost = tokensCostKWD(Number(t.in_tok), Number(t.out_tok), Number(t.cw_tok), Number(t.cr_tok));
+    const cost24 = tokensCostKWD(Number(t.in24), Number(t.out24), Number(t.cw24), Number(t.cr24));
+    const avgCost = Number(t.total) > 0 ? totalCost / Number(t.total) : 0;
+    const fils = kwd => Math.round(kwd * 1000);          // دينار → فلس
+    const dinar = kwd => kwd.toFixed(3);                 // عرض بالدينار
 
     const bad = await pool.query(`
       SELECT question FROM questions_log
@@ -316,7 +357,13 @@ async function buildStatsReport() {
     if (satisfaction !== null) {
       report += `\n⭐ نسبة الرضا: ${satisfaction}% (من ${rated} تقييم)\n`;
     }
-    report += `\n🔎 أسئلة بلا مصدر محدد (fallback): ${t.fallback}`;
+    report += `\n🔎 أسئلة بلا مصدر محدد (fallback): ${t.fallback}\n`;
+
+    report +=
+      '\n💰 التكلفة\n' +
+      `متوسط السؤال: ${fils(avgCost)} فلس\n` +
+      `آخر ٢٤ ساعة: ${dinar(cost24)} د.ك\n` +
+      `الإجمالي: ${dinar(totalCost)} د.ك`;
 
     if (bad.rows.length > 0) {
       report += '\n\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
