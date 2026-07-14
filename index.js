@@ -25,9 +25,12 @@ async function initDatabase() {
         free_questions_used INTEGER DEFAULT 0,
         subscribed_until DATE,
         daily_questions INTEGER DEFAULT 0,
-        last_question_date DATE
+        last_question_date DATE,
+        paid_balance INTEGER DEFAULT 0
       )
     `);
+    // رصيد الأسئلة المدفوع (نظام الشحن) — للجداول المُنشأة سابقاً
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_balance INTEGER DEFAULT 0`);
     // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم، والتكلفة
     await pool.query(`
       CREATE TABLE IF NOT EXISTS questions_log (
@@ -217,8 +220,9 @@ async function checkUserAccess(phone) {
   const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
   const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
   const dailyCount = (lastDate === today) ? user.daily_questions : 0;
+  const balance = user.paid_balance || 0;
 
-  // المشترك المدفوع - 10 يومياً
+  // المشترك الشهري القديم (إن وُجد) - 10 يومياً
   if (isSubscribed) {
     if (dailyCount >= DAILY_PAID_LIMIT) {
       return { allowed: false, reason: 'daily_limit_paid' };
@@ -226,19 +230,22 @@ async function checkUserAccess(phone) {
     return { allowed: true, record: { type: 'paid', dailyCount, today } };
   }
 
-  // المستخدم المجاني
+  // المجاني أولاً: متاح لو ما خلّص الحد الكلي ولا اليومي
+  const freeAvailable = user.free_questions_used < TOTAL_FREE_LIMIT && dailyCount < DAILY_FREE_LIMIT;
+  if (freeAvailable) {
+    return { allowed: true, record: { type: 'free', dailyCount, today } };
+  }
 
-  // فحص 1: هل خلّص الـ 6 الكلية؟
+  // خلّص المجاني → استخدم الرصيد المدفوع (الشحن) إن وُجد — بدون حد يومي ولا انتهاء
+  if (balance > 0) {
+    return { allowed: true, record: { type: 'balance' } };
+  }
+
+  // لا مجاني ولا رصيد → محظور (نميّز السبب للرسالة المناسبة)
   if (user.free_questions_used >= TOTAL_FREE_LIMIT) {
-    return { allowed: false, reason: 'total_free_exhausted' };
+    return { allowed: false, reason: 'no_balance' };       // خلص المجاني نهائياً
   }
-
-  // فحص 2: هل خلّص الـ 2 اليومية؟
-  if (dailyCount >= DAILY_FREE_LIMIT) {
-    return { allowed: false, reason: 'daily_free_limit' };
-  }
-
-  return { allowed: true, record: { type: 'free', dailyCount, today } };
+  return { allowed: false, reason: 'daily_free_limit' };   // بس الحد اليومي (يرجع بكرة)
 }
 
 // يحسب السؤال فعلياً (يزيد العدّادات) — يُستدعى فقط بعد نجاح الرد.
@@ -258,6 +265,12 @@ async function recordQuestion(phone, record) {
          last_question_date = $2`,
       [phone, today]
     );
+  } else if (type === 'balance') {
+    // ينقص من الرصيد المدفوع (لا يمس عدّادات المجاني ولا الحد اليومي)
+    await pool.query(
+      'UPDATE users SET paid_balance = GREATEST(paid_balance - 1, 0) WHERE phone = $1',
+      [phone]
+    );
   } else if (type === 'paid') {
     await pool.query(
       'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
@@ -269,6 +282,30 @@ async function recordQuestion(phone, record) {
       [dailyCount + 1, today, phone]
     );
   }
+}
+
+// يشحن رصيد أسئلة لرقم معيّن (أمر إداري) ويرجّع الرصيد الجديد.
+async function rechargeUser(phone, count) {
+  const result = await pool.query(
+    `INSERT INTO users (phone, paid_balance) VALUES ($1, $2)
+     ON CONFLICT (phone) DO UPDATE SET paid_balance = users.paid_balance + $2
+     RETURNING paid_balance`,
+    [phone, count]
+  );
+  return result.rows[0].paid_balance;
+}
+
+// يرجّع رصيد المستخدم: المتبقي المجاني + الرصيد المدفوع
+async function getUserBalance(phone) {
+  const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+  if (result.rows.length === 0) {
+    return { freeLeft: TOTAL_FREE_LIMIT, paid: 0 };
+  }
+  const u = result.rows[0];
+  return {
+    freeLeft: Math.max(0, TOTAL_FREE_LIMIT - (u.free_questions_used || 0)),
+    paid: u.paid_balance || 0
+  };
 }
 
 // يسجّل السؤال في جدول Analytics ويرجّع معرّفه (لربط التقييم به لاحقاً).
@@ -1034,6 +1071,35 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // أمر إداري: شحن رصيد أسئلة لعميل — /اشحن <الرقم> <العدد>
+    if (WHITELIST.includes(from) && cmd.startsWith('اشحن')) {
+      const parts = cmd.split(/\s+/);
+      const targetPhone = (parts[1] || '').replace(/\D/g, '');
+      const count = parseInt(parts[2], 10);
+      if (!targetPhone || !Number.isInteger(count) || count <= 0) {
+        await sendMessage(from,
+          'صيغة غير صحيحة ⚠️\n\n' +
+          'اكتب: اشحن رقم_العميل عدد_الأسئلة\n' +
+          'مثال: اشحن 96512345678 30'
+        );
+        return;
+      }
+      const newBalance = await rechargeUser(targetPhone, count);
+      await sendMessage(from, `✅ تم شحن ${count} سؤال للرقم ${targetPhone}\nرصيده الآن: ${newBalance} سؤال`);
+      return;
+    }
+
+    // أمر للمستخدم: عرض رصيده — /رصيد
+    if (cmd === 'رصيد' || cmd === 'رصيدي') {
+      const bal = await getUserBalance(from);
+      await sendMessage(from,
+        '💼 رصيدك\n\n' +
+        `🆓 أسئلة مجانية متبقية: ${bal.freeLeft}\n` +
+        `💳 رصيد مدفوع: ${bal.paid} سؤال`
+      );
+      return;
+    }
+
     // تقييم الرد بإيموجي (👍/👎): يُربط بآخر سؤال — لا يُحسب سؤالاً ولا يذهب للموديل
     const feedback = parseFeedbackEmoji(text);
     if (feedback) {
@@ -1055,18 +1121,17 @@ app.post('/webhook', async (req, res) => {
 
     const access = await checkUserAccess(from);
     if (!access.allowed) {
-      // ثلاث رسائل حظر مختلفة بحسب الحالة
       if (access.reason === 'daily_free_limit') {
         await sendMessage(from,
           'خلصت أسئلتك المجانية لهذا اليوم 🔒\n\n' +
-          'تقدر تسأل من جديد بكرا، أو تشترك بالباقة المدفوعة الآن للحصول على 10 أسئلة يومياً بدون انتظار.\n\n' +
-          'للاشتراك تواصل معنا.'
+          'تقدر تسأل من جديد بكرا، أو تشحن رصيد أسئلة تستخدمه وقت ما تحب.\n\n' +
+          '📦 باقة: 10 د.ك = 30 سؤال (بدون انتهاء).\nللشحن تواصل معنا.'
         );
-      } else if (access.reason === 'total_free_exhausted') {
+      } else if (access.reason === 'no_balance') {
         await sendMessage(from,
           'خلصت أسئلتك المجانية 🔒\n\n' +
-          'للاستمرار يرجى الاشتراك بالباقة المدفوعة للحصول على 10 أسئلة يومياً.\n\n' +
-          'للاشتراك تواصل معنا.'
+          'للاستمرار اشحن رصيد أسئلة — تستخدمه وقت ما تحب بدون انتهاء.\n\n' +
+          '📦 باقة: 10 د.ك = 30 سؤال.\nللشحن تواصل معنا.'
         );
       } else if (access.reason === 'daily_limit_paid') {
         await sendMessage(from,
