@@ -50,6 +50,13 @@ async function initDatabase() {
     // للجداول المُنشأة سابقاً: نضيف أعمدة الكاش إن لم تكن موجودة
     await pool.query(`ALTER TABLE questions_log ADD COLUMN IF NOT EXISTS cache_write INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE questions_log ADD COLUMN IF NOT EXISTS cache_read INTEGER DEFAULT 0`);
+    // منع تكرار الرسائل عبر قاعدة البيانات (يصمد عبر إعادة التشغيل والنسخ المتعددة)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS processed_messages (
+        id VARCHAR(128) PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
     console.log('Database tables ready');
   } catch (error) {
     console.error('Database init error:', error.message);
@@ -947,6 +954,10 @@ ${sectionsIndex}
 - أرجع معرفات (id) المصادر المتعلقة فقط، مفصولة بفاصلة. مثال: labor_law,manpower_responses
 - كن دقيقاً ومحدداً: أرجع أقل عدد من المصادر يغطي السؤال. لا ترجع مصدراً إلا إذا له علاقة مباشرة.
 - أسئلة الرواتب والمكافآت وأيام العمل والإجازات ونهاية الخدمة → labor_law (وأضف manpower_responses إن كان حساباً).
+- ⚠️ تمييز مهم بين الأفرع المستثمرة والمشروعات الصغيرة (كلاهما "محلات"):
+  • استثمار فرع/محل تجاري بالمزايدة لأعلى قيمة استثمارية شهرية، أو "الأفرع المستثمرة"، أو "الطرح العادي"، أو "استثمار فرع بالجمعية" → decision_196 (الباب: استثمار الأفرع من الغير).
+  • المشروعات/المشاريع الصغيرة، القواطع، المبادرين، سجل المبادرين → decision_75.
+  • لو السؤال عام (مثل "شنو شروط أخذ محل بالجمعية") ولم يوضّح النوع → أرجع decision_196,decision_75 معاً ليعرض الموديل الخيارين.
 - ⚠️ decision_46 قرار ملغي: لا ترجعه إطلاقاً إلا إذا ذكر المستخدم صراحةً "القرار 46" أو "46/ت" أو "القانون الملغي" — وفي هذه الحالة أرجع decision_46 وحده فقط. لغير ذلك استخدم decision_196 (الساري).
 - لو ما قدرت تحدد بثقة، أرجع أقرب 2-3 مصادر محتملة (وليس الكل). أرجع ALL فقط في أضيق الحالات (سؤال شامل يمس عدة قوانين).
 - ممنوع تكتب أي شي ثاني — معرفات أو ALL فقط، بدون شرح.`;
@@ -1011,22 +1022,31 @@ function buildContent(ids, usedFallback) {
 }
 
 // ============ منع تكرار الرسائل (WhatsApp Webhook Retry) ============
-// واتساب يعيد إرسال نفس الرسالة أحياناً عند عدم استلام ACK بسرعة.
-// نحفظ معرّفات الرسائل المعالَجة مؤقتاً لتجاهل المكرر (رد مزدوج / حسبة مزدوجة).
-const processedMessages = new Map(); // message.id → timestamp
-const MESSAGE_DEDUP_TTL = 10 * 60 * 1000; // 10 دقائق
-
-function isDuplicateMessage(id) {
+// واتساب يعيد إرسال نفس الرسالة أحياناً، وقد يُعاد تشغيل الخادم أو تتعدد نسخه.
+// نستخدم قاعدة البيانات (INSERT ذري) لضمان معالجة كل رسالة مرة واحدة فقط
+// عبر كل النسخ وإعادات التشغيل — يمنع الردود المزدوجة نهائياً.
+async function isDuplicateMessage(id) {
   if (!id) return false;
-  const now = Date.now();
-  // تنظيف المعرّفات القديمة لمنع نمو الذاكرة
-  for (const [mid, ts] of processedMessages) {
-    if (now - ts > MESSAGE_DEDUP_TTL) processedMessages.delete(mid);
+  try {
+    const r = await pool.query(
+      'INSERT INTO processed_messages (id) VALUES ($1) ON CONFLICT (id) DO NOTHING RETURNING id',
+      [id]
+    );
+    return r.rowCount === 0; // صفر = المعرّف موجود مسبقاً = رسالة مكررة
+  } catch (error) {
+    console.error('dedup error:', error.message);
+    return false; // عند خطأ القاعدة نكمل المعالجة (أفضل من تجاهل رسالة حقيقية)
   }
-  if (processedMessages.has(id)) return true;
-  processedMessages.set(id, now);
-  return false;
 }
+
+// تنظيف يومي لمعرّفات الرسائل القديمة (أقدم من يوم) لمنع نمو الجدول
+setInterval(async () => {
+  try {
+    await pool.query(`DELETE FROM processed_messages WHERE created_at < NOW() - INTERVAL '1 day'`);
+  } catch (error) {
+    console.error('dedup cleanup error:', error.message);
+  }
+}, 6 * 60 * 60 * 1000); // كل 6 ساعات
 
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -1054,8 +1074,8 @@ app.post('/webhook', async (req, res) => {
     if (!message) return;
     from = message.from;
 
-    // منع التكرار أولاً — يشمل النص وردود الأزرار (webhook retry)
-    if (isDuplicateMessage(message.id)) {
+    // منع التكرار أولاً (عبر قاعدة البيانات) — يمنع الردود المزدوجة نهائياً
+    if (await isDuplicateMessage(message.id)) {
       console.log(`Duplicate message ignored → ${message.id}`);
       return;
     }
