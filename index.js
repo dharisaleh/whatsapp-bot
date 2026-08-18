@@ -1111,7 +1111,7 @@ app.post('/webhook', async (req, res) => {
 
     // أمر إداري للمالك فقط (WHITELIST): ملخص التقييمات والإحصائيات
     const cmd = text.trim().replace(/^\//, '');
-    if (WHITELIST.includes(from) && (cmd === 'تقييمات' || cmd === 'احصائيات' || cmd === 'إحصائيات')) {
+    if (WHITELIST.includes(from) && (cmd === 'تقرير' || cmd === 'تقييمات' || cmd === 'احصائيات' || cmd === 'إحصائيات')) {
       const report = await buildStatsReport();
       await sendMessage(from, report);
       return;
