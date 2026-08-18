@@ -382,10 +382,17 @@ async function buildStatsReport() {
     const dinar = kwd => kwd.toFixed(3);                 // عرض بالدينار
 
     const bad = await pool.query(`
-      SELECT question FROM questions_log
+      SELECT phone, question FROM questions_log
       WHERE rating = 'down'
       ORDER BY created_at DESC
-      LIMIT 5
+      LIMIT 8
+    `);
+
+    const good = await pool.query(`
+      SELECT phone, question FROM questions_log
+      WHERE rating = 'up'
+      ORDER BY created_at DESC
+      LIMIT 8
     `);
 
     // عدد أسئلة كل رقم (الأكثر أولاً)
@@ -429,11 +436,19 @@ async function buildStatsReport() {
       });
     }
 
+    if (good.rows.length > 0) {
+      report += '\n👍 آخر أسئلة قُيّمت مفيدة:\n';
+      good.rows.forEach((r, i) => {
+        const q = (r.question || '').slice(0, 70);
+        report += `${i + 1}. ${r.phone} — ${q}\n`;
+      });
+    }
+
     if (bad.rows.length > 0) {
       report += '\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
       bad.rows.forEach((r, i) => {
-        const q = (r.question || '').slice(0, 80);
-        report += `${i + 1}. ${q}\n`;
+        const q = (r.question || '').slice(0, 70);
+        report += `${i + 1}. ${r.phone} — ${q}\n`;
       });
     }
     return report;
