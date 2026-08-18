@@ -99,7 +99,7 @@ const lastSectionIds = {};
 const conversationHistory = {};
 // آخر سؤال مُسجّل لكل مستخدم — لربط تقييمه (👍/👎) بالسؤال الصحيح
 const lastQuestionId = {};
-const WHITELIST = ['96555667373', '96596049491'];
+const WHITELIST = ['96555667373', '96596049491', '96555282800'];
 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
