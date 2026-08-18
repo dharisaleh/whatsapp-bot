@@ -388,6 +388,17 @@ async function buildStatsReport() {
       LIMIT 5
     `);
 
+    // عدد أسئلة كل رقم (الأكثر أولاً)
+    const byPhone = await pool.query(`
+      SELECT phone,
+             COUNT(*)                                                          AS cnt,
+             COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')  AS cnt24
+      FROM questions_log
+      GROUP BY phone
+      ORDER BY cnt DESC
+      LIMIT 25
+    `);
+
     const rated = Number(t.up) + Number(t.down);
     const satisfaction = rated > 0 ? Math.round((Number(t.up) / rated) * 100) : null;
 
@@ -410,8 +421,16 @@ async function buildStatsReport() {
       `آخر ٢٤ ساعة: ${dinar(cost24)} د.ك\n` +
       `الإجمالي: ${dinar(totalCost)} د.ك`;
 
+    if (byPhone.rows.length > 0) {
+      report += '\n\n📱 الأسئلة حسب الرقم:\n';
+      byPhone.rows.forEach((r, i) => {
+        const t24 = Number(r.cnt24) > 0 ? ` (${r.cnt24} اليوم)` : '';
+        report += `${i + 1}. ${r.phone}: ${r.cnt} سؤال${t24}\n`;
+      });
+    }
+
     if (bad.rows.length > 0) {
-      report += '\n\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
+      report += '\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
       bad.rows.forEach((r, i) => {
         const q = (r.question || '').slice(0, 80);
         report += `${i + 1}. ${q}\n`;
