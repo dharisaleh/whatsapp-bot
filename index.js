@@ -36,6 +36,8 @@ async function initDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by VARCHAR(20)`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referrals_count INTEGER DEFAULT 0`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`);
+    // نظام النقاط: رصيد نقاط موحّد لكل مستخدم (هدية التسجيل 60 = default)
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 60`);
     // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم، والتكلفة
     await pool.query(`
       CREATE TABLE IF NOT EXISTS questions_log (
@@ -115,9 +117,19 @@ const TOTAL_FREE_LIMIT = 6;       // الحد الأقصى المجاني الإ
 const DAILY_FREE_LIMIT = 2;       // الحد اليومي للمستخدم المجاني (FREE_LIMIT=2)
 const DAILY_PAID_LIMIT = 10;      // الحد اليومي للمشترك المدفوع (DAILY_LIMIT=10)
 
-// نظام الإحالة: كم سؤال مجاني يكسب الطرفان عند نجاح الدعوة
-const REFERRAL_INVITER_REWARD = 5;  // للداعي (صاحب الكود)
-const REFERRAL_INVITEE_REWARD = 3;  // للمدعو (من استخدم الكود)
+// ===== نظام النقاط (بوينتات) =====
+const POINTS_PER_QUESTION = 10;      // تكلفة السؤال الواحد بالنقاط
+const SIGNUP_POINTS = 60;            // هدية التسجيل (= 6 أسئلة) — يجب أن تطابق DEFAULT عمود points
+const REFERRAL_INVITER_REWARD = 50;  // نقاط الداعي (صاحب الكود)
+const REFERRAL_INVITEE_REWARD = 30;  // نقاط المدعو (من استخدم الكود)
+const RATING_REWARD = 2;             // نقاط عند تقييم جواب (👍/👎)
+
+// نص الباقات (يُعرض عند نفاد النقاط وفي أمر الشحن)
+const PACKAGES_TEXT =
+  '📦 باقات النقاط:\n' +
+  '• 2 د.ك = 80 نقطة (8 أسئلة)\n' +
+  '• 5 د.ك = 250 نقطة (25 سؤال)\n' +
+  '• 10 د.ك = 600 نقطة (60 سؤال) 🔥';
 
 // ===== أسعار موديل claude-sonnet-4-6 (دولار لكل مليون توكن) =====
 // عدّلها هنا فقط لو تغيّرت الأسعار.
@@ -225,78 +237,35 @@ async function checkUserAccess(phone) {
     return { allowed: true, record: null };
   }
 
-  const today = getKuwaitDate();
-  const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+  const result = await pool.query('SELECT points FROM users WHERE phone = $1', [phone]);
 
-  // مستخدم جديد - السؤال الأول (الإدراج يتم بعد نجاح الرد)
+  // مستخدم جديد — يبدأ برصيد التسجيل (الإدراج بعد نجاح الرد)
   if (result.rows.length === 0) {
-    return { allowed: true, record: { type: 'new', today } };
+    return { allowed: true, record: { type: 'new' } };
   }
 
-  const user = result.rows[0];
-  const isSubscribed = user.subscribed_until && new Date(user.subscribed_until) >= new Date(today);
-  const lastDate = user.last_question_date ? user.last_question_date.toISOString().split('T')[0] : null;
-  const dailyCount = (lastDate === today) ? user.daily_questions : 0;
-  const balance = user.paid_balance || 0;
-
-  // المشترك الشهري القديم (إن وُجد) - 10 يومياً
-  if (isSubscribed) {
-    if (dailyCount >= DAILY_PAID_LIMIT) {
-      return { allowed: false, reason: 'daily_limit_paid' };
-    }
-    return { allowed: true, record: { type: 'paid', dailyCount, today } };
+  const points = result.rows[0].points ?? 0;
+  if (points >= POINTS_PER_QUESTION) {
+    return { allowed: true, record: { type: 'existing' } };
   }
-
-  // المجاني أولاً: متاح لو ما خلّص الحد الكلي ولا اليومي
-  const freeAvailable = user.free_questions_used < TOTAL_FREE_LIMIT && dailyCount < DAILY_FREE_LIMIT;
-  if (freeAvailable) {
-    return { allowed: true, record: { type: 'free', dailyCount, today } };
-  }
-
-  // خلّص المجاني → استخدم الرصيد المدفوع (الشحن) إن وُجد — بدون حد يومي ولا انتهاء
-  if (balance > 0) {
-    return { allowed: true, record: { type: 'balance' } };
-  }
-
-  // لا مجاني ولا رصيد → محظور (نميّز السبب للرسالة المناسبة)
-  if (user.free_questions_used >= TOTAL_FREE_LIMIT) {
-    return { allowed: false, reason: 'no_balance' };       // خلص المجاني نهائياً
-  }
-  return { allowed: false, reason: 'daily_free_limit' };   // بس الحد اليومي (يرجع بكرة)
+  return { allowed: false, reason: 'no_points' }; // خلصت النقاط
 }
 
-// يحسب السؤال فعلياً (يزيد العدّادات) — يُستدعى فقط بعد نجاح الرد.
+// يخصم نقاط السؤال فعلياً — يُستدعى فقط بعد نجاح الرد.
 // ON CONFLICT يحمي من تسابق رسالتين متزامنتين لمستخدم جديد.
 async function recordQuestion(phone, record) {
-  if (!record) return; // قائمة بيضاء — لا يُحسب
-  const { type, today, dailyCount } = record;
-
-  if (type === 'new') {
+  if (!record) return; // قائمة بيضاء — لا يُخصم
+  if (record.type === 'new') {
+    // ننشئه برصيد التسجيل ناقص سؤالاً؛ ولو وُجد (تسابق) نخصم فقط
     await pool.query(
-      `INSERT INTO users (phone, free_questions_used, daily_questions, last_question_date)
-       VALUES ($1, 1, 1, $2)
-       ON CONFLICT (phone) DO UPDATE SET
-         free_questions_used = users.free_questions_used + 1,
-         daily_questions = CASE WHEN users.last_question_date = $2
-                                THEN users.daily_questions + 1 ELSE 1 END,
-         last_question_date = $2`,
-      [phone, today]
+      `INSERT INTO users (phone, points) VALUES ($1, $2)
+       ON CONFLICT (phone) DO UPDATE SET points = GREATEST(users.points - $3, 0)`,
+      [phone, SIGNUP_POINTS - POINTS_PER_QUESTION, POINTS_PER_QUESTION]
     );
-  } else if (type === 'balance') {
-    // ينقص من الرصيد المدفوع (لا يمس عدّادات المجاني ولا الحد اليومي)
+  } else {
     await pool.query(
-      'UPDATE users SET paid_balance = GREATEST(paid_balance - 1, 0) WHERE phone = $1',
-      [phone]
-    );
-  } else if (type === 'paid') {
-    await pool.query(
-      'UPDATE users SET daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-      [dailyCount + 1, today, phone]
-    );
-  } else { // free
-    await pool.query(
-      'UPDATE users SET free_questions_used = free_questions_used + 1, daily_questions = $1, last_question_date = $2 WHERE phone = $3',
-      [dailyCount + 1, today, phone]
+      'UPDATE users SET points = GREATEST(points - $1, 0) WHERE phone = $2',
+      [POINTS_PER_QUESTION, phone]
     );
   }
 }
@@ -304,12 +273,12 @@ async function recordQuestion(phone, record) {
 // يشحن رصيد أسئلة لرقم معيّن (أمر إداري) ويرجّع الرصيد الجديد.
 async function rechargeUser(phone, count) {
   const result = await pool.query(
-    `INSERT INTO users (phone, paid_balance) VALUES ($1, $2)
-     ON CONFLICT (phone) DO UPDATE SET paid_balance = users.paid_balance + $2
-     RETURNING paid_balance`,
+    `INSERT INTO users (phone, points) VALUES ($1, $2)
+     ON CONFLICT (phone) DO UPDATE SET points = users.points + $2
+     RETURNING points`,
     [phone, count]
   );
-  return result.rows[0].paid_balance;
+  return result.rows[0].points;
 }
 
 // يولّد كود دعوة قصيراً (بدون أحرف/أرقام ملتبسة: 0/O/1/I)
@@ -352,32 +321,26 @@ async function redeemReferral(redeemerPhone, rawCode) {
   const me = await pool.query('SELECT referred_by FROM users WHERE phone = $1', [redeemerPhone]);
   if (me.rows[0]?.referred_by) return { ok: false, reason: 'already' };
 
-  // نكافئ المدعو (+رصيد) ونثبّت من دعاه
+  // نكافئ المدعو: نقاط التسجيل + مكافأة الدعوة إن كان جديداً، أو نضيف المكافأة إن كان موجوداً
   await pool.query(
-    `INSERT INTO users (phone, referred_by, paid_balance) VALUES ($1, $2, $3)
+    `INSERT INTO users (phone, referred_by, points) VALUES ($1, $2, $3)
      ON CONFLICT (phone) DO UPDATE SET referred_by = EXCLUDED.referred_by,
-                                       paid_balance = users.paid_balance + EXCLUDED.paid_balance`,
-    [redeemerPhone, ownerPhone, REFERRAL_INVITEE_REWARD]
+                                       points = users.points + $4`,
+    [redeemerPhone, ownerPhone, SIGNUP_POINTS + REFERRAL_INVITEE_REWARD, REFERRAL_INVITEE_REWARD]
   );
-  // نكافئ الداعي (+رصيد) ونزيد عدّاد دعواته
+  // نكافئ الداعي (+نقاط) ونزيد عدّاد دعواته
   await pool.query(
-    'UPDATE users SET paid_balance = paid_balance + $1, referrals_count = referrals_count + 1 WHERE phone = $2',
+    'UPDATE users SET points = points + $1, referrals_count = referrals_count + 1 WHERE phone = $2',
     [REFERRAL_INVITER_REWARD, ownerPhone]
   );
   return { ok: true, ownerPhone };
 }
 
-// يرجّع رصيد المستخدم: المتبقي المجاني + الرصيد المدفوع
+// يرجّع رصيد المستخدم بالنقاط + ما يعادلها من أسئلة
 async function getUserBalance(phone) {
-  const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-  if (result.rows.length === 0) {
-    return { freeLeft: TOTAL_FREE_LIMIT, paid: 0 };
-  }
-  const u = result.rows[0];
-  return {
-    freeLeft: Math.max(0, TOTAL_FREE_LIMIT - (u.free_questions_used || 0)),
-    paid: u.paid_balance || 0
-  };
+  const result = await pool.query('SELECT points FROM users WHERE phone = $1', [phone]);
+  const points = result.rows.length ? (result.rows[0].points ?? 0) : SIGNUP_POINTS;
+  return { points, questions: Math.floor(points / POINTS_PER_QUESTION) };
 }
 
 // يسجّل السؤال في جدول Analytics ويرجّع معرّفه (لربط التقييم به لاحقاً).
@@ -1195,8 +1158,8 @@ app.get('/webhook', (req, res) => {
 const WELCOME_MESSAGE =
   'أهلاً وسهلاً 👋\n\n' +
   'أنا "تعاوني" — مساعدك للأسئلة عن قوانين وقرارات العمل التعاوني والعمل في الكويت.\n\n' +
-  `عندك ${TOTAL_FREE_LIMIT} أسئلة مجانية (بحد ${DAILY_FREE_LIMIT} يومياً). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚\n\n` +
-  '🎁 وتقدر تكسب أسئلة مجانية إضافية بدعوة أصدقائك — اكتب: دعوة';
+  `🎁 عندك ${SIGNUP_POINTS} نقطة هدية (كل سؤال = ${POINTS_PER_QUESTION} نقاط، يعني ${Math.floor(SIGNUP_POINTS / POINTS_PER_QUESTION)} أسئلة). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚\n\n` +
+  'وتقدر تكسب نقاط إضافية بدعوة أصدقائك — اكتب: دعوة';
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -1239,13 +1202,14 @@ app.post('/webhook', async (req, res) => {
       if (!targetPhone || !Number.isInteger(count) || count <= 0) {
         await sendMessage(from,
           'صيغة غير صحيحة ⚠️\n\n' +
-          'اكتب: اشحن رقم_العميل عدد_الأسئلة\n' +
-          'مثال: اشحن 96512345678 30'
+          'اكتب: اشحن رقم_العميل عدد_النقاط\n' +
+          'مثال: اشحن 96512345678 250\n\n' +
+          PACKAGES_TEXT
         );
         return;
       }
       const newBalance = await rechargeUser(targetPhone, count);
-      await sendMessage(from, `✅ تم شحن ${count} سؤال للرقم ${targetPhone}\nرصيده الآن: ${newBalance} سؤال`);
+      await sendMessage(from, `✅ تم شحن ${count} نقطة للرقم ${targetPhone}\nرصيده الآن: ${newBalance} نقطة`);
       return;
     }
 
@@ -1254,8 +1218,8 @@ app.post('/webhook', async (req, res) => {
       const bal = await getUserBalance(from);
       await sendMessage(from,
         '💼 رصيدك\n\n' +
-        `🆓 أسئلة مجانية متبقية: ${bal.freeLeft}\n` +
-        `💳 رصيد مدفوع: ${bal.paid} سؤال`
+        `⭐ نقاطك: ${bal.points} نقطة\n` +
+        `📚 يكفي لـ ${bal.questions} سؤال (كل سؤال = ${POINTS_PER_QUESTION} نقاط)`
       );
       return;
     }
@@ -1266,11 +1230,11 @@ app.post('/webhook', async (req, res) => {
       const result = await redeemReferral(from, redeemMatch[1]);
       if (result.ok) {
         await sendMessage(from,
-          `🎉 تم! حصلت على ${REFERRAL_INVITEE_REWARD} أسئلة مجانية.\n\nاكتب سؤالك مباشرة 📚`
+          `🎉 تم! حصلت على ${REFERRAL_INVITEE_REWARD} نقطة.\n\nاكتب سؤالك مباشرة 📚`
         );
         // نبلّغ صاحب الكود بمكافأته
         await sendMessage(result.ownerPhone,
-          `🎁 صديق انضم عن طريق كودك!\nحصلت على ${REFERRAL_INVITER_REWARD} أسئلة مجانية. شكراً لنشرك تعاوني 🙏`
+          `🎁 صديق انضم عن طريق كودك!\nحصلت على ${REFERRAL_INVITER_REWARD} نقطة. شكراً لنشرك تعاوني 🙏`
         );
       } else if (result.reason === 'self') {
         await sendMessage(from, 'ما تقدر تستخدم كودك الخاص 🙂\nشاركه مع أصدقائك عشان تكسب أسئلة.');
@@ -1289,7 +1253,7 @@ app.post('/webhook', async (req, res) => {
         '🎁 ادعُ أصدقاءك واكسب أسئلة مجانية!\n\n' +
         `كودك الخاص: *${code}*\n\n` +
         `لمن يرسل صديقك للبوت هالرسالة:\nكود ${code}\n\n` +
-        `➕ صديقك يحصل على ${REFERRAL_INVITEE_REWARD} أسئلة، وأنت على ${REFERRAL_INVITER_REWARD} أسئلة — عن كل صديق ينضم! 🌟`;
+        `➕ صديقك يحصل على ${REFERRAL_INVITEE_REWARD} نقطة، وأنت على ${REFERRAL_INVITER_REWARD} نقطة — عن كل صديق ينضم! 🌟`;
       const botNum = (process.env.BOT_NUMBER || '').replace(/\D/g, '');
       if (botNum) {
         const link = `https://wa.me/${botNum}?text=${encodeURIComponent('كود ' + code)}`;
@@ -1306,7 +1270,17 @@ app.post('/webhook', async (req, res) => {
       if (qid) {
         await recordFeedback(qid, feedback);
         delete lastQuestionId[from]; // تقييم واحد لكل سؤال
-        await sendMessage(from, feedback === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏');
+        let thanks = feedback === 'up' ? 'شكراً لتقييمك 🙏' : 'شكراً، بنطوّر خدمتنا 🙏';
+        // مكافأة النقاط على التقييم (لغير المالكين) — تحفّز التقييم الذي يطوّر البوت
+        if (!WHITELIST.includes(from)) {
+          await pool.query(
+            `INSERT INTO users (phone, points) VALUES ($1, $2)
+             ON CONFLICT (phone) DO UPDATE SET points = users.points + $3`,
+            [from, SIGNUP_POINTS + RATING_REWARD, RATING_REWARD]
+          );
+          thanks += `\n🎁 +${RATING_REWARD} نقطة`;
+        }
+        await sendMessage(from, thanks);
       }
       return;
     }
@@ -1320,26 +1294,13 @@ app.post('/webhook', async (req, res) => {
 
     const access = await checkUserAccess(from);
     if (!access.allowed) {
-      if (access.reason === 'daily_free_limit') {
-        await sendMessage(from,
-          'خلصت أسئلتك المجانية لهذا اليوم 🔒\n\n' +
-          'تقدر تسأل من جديد بكرا، أو تشحن رصيد أسئلة تستخدمه وقت ما تحب.\n\n' +
-          '📦 باقة: 10 د.ك = 30 سؤال (بدون انتهاء).\nللشحن تواصل معنا.\n\n' +
-          '🎁 أو ادعُ أصدقاءك واكسب أسئلة مجانية — اكتب: دعوة'
-        );
-      } else if (access.reason === 'no_balance') {
-        await sendMessage(from,
-          'خلصت أسئلتك المجانية 🔒\n\n' +
-          'للاستمرار اشحن رصيد أسئلة — تستخدمه وقت ما تحب بدون انتهاء.\n\n' +
-          '📦 باقة: 10 د.ك = 30 سؤال.\nللشحن تواصل معنا.\n\n' +
-          '🎁 أو ادعُ أصدقاءك واكسب أسئلة مجانية — اكتب: دعوة'
-        );
-      } else if (access.reason === 'daily_limit_paid') {
-        await sendMessage(from,
-          'وصلت الحد اليومي ⏰\n\n' +
-          'تقدر تسأل من جديد بكرا. شكراً لك 🌟'
-        );
-      }
+      // خلصت النقاط
+      await sendMessage(from,
+        'خلصت نقاطك ⭐\n\n' +
+        'للاستمرار اشحن نقاط — تستخدمها وقت ما تحب بدون انتهاء.\n\n' +
+        PACKAGES_TEXT + '\nللشحن تواصل معنا.\n\n' +
+        '🎁 أو ادعُ أصدقاءك واكسب نقاط مجانية — اكتب: دعوة'
+      );
       return;
     }
 
