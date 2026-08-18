@@ -381,20 +381,6 @@ async function buildStatsReport() {
     const fils = kwd => Math.round(kwd * 1000);          // دينار → فلس
     const dinar = kwd => kwd.toFixed(3);                 // عرض بالدينار
 
-    const bad = await pool.query(`
-      SELECT phone, question FROM questions_log
-      WHERE rating = 'down'
-      ORDER BY created_at DESC
-      LIMIT 8
-    `);
-
-    const good = await pool.query(`
-      SELECT phone, question FROM questions_log
-      WHERE rating = 'up'
-      ORDER BY created_at DESC
-      LIMIT 8
-    `);
-
     // عدد أسئلة كل رقم (الأكثر أولاً)
     const byPhone = await pool.query(`
       SELECT phone,
@@ -436,8 +422,49 @@ async function buildStatsReport() {
       });
     }
 
+    return report;
+  } catch (error) {
+    console.error('buildStatsReport error:', error.message);
+    return 'تعذّر جلب الإحصائيات حالياً 🙏';
+  }
+}
+
+// يبني تقرير التقييمات للمالك: نسبة الرضا + الأسئلة المقيّمة 👍/👎 مع رقم من قيّمها
+async function buildRatingsReport() {
+  try {
+    const c = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE rating = 'up')   AS up,
+        COUNT(*) FILTER (WHERE rating = 'down') AS down
+      FROM questions_log
+    `);
+    const up = Number(c.rows[0].up), down = Number(c.rows[0].down);
+    const rated = up + down;
+    const satisfaction = rated > 0 ? Math.round((up / rated) * 100) : null;
+
+    const good = await pool.query(`
+      SELECT phone, question FROM questions_log
+      WHERE rating = 'up'
+      ORDER BY created_at DESC
+      LIMIT 15
+    `);
+    const bad = await pool.query(`
+      SELECT phone, question FROM questions_log
+      WHERE rating = 'down'
+      ORDER BY created_at DESC
+      LIMIT 15
+    `);
+
+    let report = '⭐ تقرير التقييمات\n\n';
+    report += `👍 مفيد: ${up}\n👎 غير مفيد: ${down}\n`;
+    if (satisfaction !== null) {
+      report += `\n⭐ نسبة الرضا: ${satisfaction}% (من ${rated} تقييم)\n`;
+    } else {
+      report += '\nلا يوجد تقييمات بعد.\n';
+    }
+
     if (good.rows.length > 0) {
-      report += '\n👍 آخر أسئلة قُيّمت مفيدة:\n';
+      report += '\n👍 أسئلة قُيّمت مفيدة:\n';
       good.rows.forEach((r, i) => {
         const q = (r.question || '').slice(0, 70);
         report += `${i + 1}. ${r.phone} — ${q}\n`;
@@ -445,7 +472,7 @@ async function buildStatsReport() {
     }
 
     if (bad.rows.length > 0) {
-      report += '\n👎 آخر أسئلة قُيّمت غير مفيدة:\n';
+      report += '\n👎 أسئلة قُيّمت غير مفيدة:\n';
       bad.rows.forEach((r, i) => {
         const q = (r.question || '').slice(0, 70);
         report += `${i + 1}. ${r.phone} — ${q}\n`;
@@ -453,8 +480,8 @@ async function buildStatsReport() {
     }
     return report;
   } catch (error) {
-    console.error('buildStatsReport error:', error.message);
-    return 'تعذّر جلب الإحصائيات حالياً 🙏';
+    console.error('buildRatingsReport error:', error.message);
+    return 'تعذّر جلب التقييمات حالياً 🙏';
   }
 }
 
@@ -1126,8 +1153,15 @@ app.post('/webhook', async (req, res) => {
 
     // أمر إداري للمالك فقط (WHITELIST): ملخص التقييمات والإحصائيات
     const cmd = text.trim().replace(/^\//, '');
-    if (WHITELIST.includes(from) && (cmd === 'تقرير' || cmd === 'تقييمات' || cmd === 'احصائيات' || cmd === 'إحصائيات')) {
+    if (WHITELIST.includes(from) && (cmd === 'تقرير' || cmd === 'احصائيات' || cmd === 'إحصائيات')) {
       const report = await buildStatsReport();
+      await sendMessage(from, report);
+      return;
+    }
+
+    // أمر إداري للمالك فقط (WHITELIST): تفاصيل التقييمات 👍/👎 مع الأرقام
+    if (WHITELIST.includes(from) && (cmd === 'تقييم' || cmd === 'تقييمات')) {
+      const report = await buildRatingsReport();
       await sendMessage(from, report);
       return;
     }
