@@ -31,6 +31,11 @@ async function initDatabase() {
     `);
     // رصيد الأسئلة المدفوع (نظام الشحن) — للجداول المُنشأة سابقاً
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_balance INTEGER DEFAULT 0`);
+    // نظام الإحالة: كود دعوة خاص بكل مستخدم، ومن دعاه، وعدد من دعاهم
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(12)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by VARCHAR(20)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referrals_count INTEGER DEFAULT 0`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code) WHERE referral_code IS NOT NULL`);
     // سجل الأسئلة (Analytics) — لمعرفة وش يُسأل، وأين لم نجد مصدراً، والتقييم، والتكلفة
     await pool.query(`
       CREATE TABLE IF NOT EXISTS questions_log (
@@ -109,6 +114,10 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const TOTAL_FREE_LIMIT = 6;       // الحد الأقصى المجاني الإجمالي للأبد
 const DAILY_FREE_LIMIT = 2;       // الحد اليومي للمستخدم المجاني (FREE_LIMIT=2)
 const DAILY_PAID_LIMIT = 10;      // الحد اليومي للمشترك المدفوع (DAILY_LIMIT=10)
+
+// نظام الإحالة: كم سؤال مجاني يكسب الطرفان عند نجاح الدعوة
+const REFERRAL_INVITER_REWARD = 5;  // للداعي (صاحب الكود)
+const REFERRAL_INVITEE_REWARD = 3;  // للمدعو (من استخدم الكود)
 
 // ===== أسعار موديل claude-sonnet-4-6 (دولار لكل مليون توكن) =====
 // عدّلها هنا فقط لو تغيّرت الأسعار.
@@ -301,6 +310,61 @@ async function rechargeUser(phone, count) {
     [phone, count]
   );
   return result.rows[0].paid_balance;
+}
+
+// يولّد كود دعوة قصيراً (بدون أحرف/أرقام ملتبسة: 0/O/1/I)
+function genReferralCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// يجيب كود إحالة المستخدم، وينشئ واحداً فريداً إن لم يوجد
+async function getOrCreateReferralCode(phone) {
+  const existing = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+  if (existing.rows[0]?.referral_code) return existing.rows[0].referral_code;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const code = genReferralCode();
+    try {
+      await pool.query(
+        `INSERT INTO users (phone, referral_code) VALUES ($1, $2)
+         ON CONFLICT (phone) DO UPDATE SET referral_code = COALESCE(users.referral_code, EXCLUDED.referral_code)`,
+        [phone, code]
+      );
+      const check = await pool.query('SELECT referral_code FROM users WHERE phone = $1', [phone]);
+      return check.rows[0].referral_code;
+    } catch (e) {
+      if (attempt === 7) throw e; // تصادم كود فريد → نعيد المحاولة بكود آخر
+    }
+  }
+}
+
+// يستخدم مدعوٌّ كودَ دعوة: يكافئ الطرفين مرة واحدة فقط
+async function redeemReferral(redeemerPhone, rawCode) {
+  const code = (rawCode || '').trim().toUpperCase();
+  const owner = await pool.query('SELECT phone FROM users WHERE referral_code = $1', [code]);
+  if (!owner.rows[0]) return { ok: false, reason: 'invalid' };
+  const ownerPhone = owner.rows[0].phone;
+  if (ownerPhone === redeemerPhone) return { ok: false, reason: 'self' };
+
+  const me = await pool.query('SELECT referred_by FROM users WHERE phone = $1', [redeemerPhone]);
+  if (me.rows[0]?.referred_by) return { ok: false, reason: 'already' };
+
+  // نكافئ المدعو (+رصيد) ونثبّت من دعاه
+  await pool.query(
+    `INSERT INTO users (phone, referred_by, paid_balance) VALUES ($1, $2, $3)
+     ON CONFLICT (phone) DO UPDATE SET referred_by = EXCLUDED.referred_by,
+                                       paid_balance = users.paid_balance + EXCLUDED.paid_balance`,
+    [redeemerPhone, ownerPhone, REFERRAL_INVITEE_REWARD]
+  );
+  // نكافئ الداعي (+رصيد) ونزيد عدّاد دعواته
+  await pool.query(
+    'UPDATE users SET paid_balance = paid_balance + $1, referrals_count = referrals_count + 1 WHERE phone = $2',
+    [REFERRAL_INVITER_REWARD, ownerPhone]
+  );
+  return { ok: true, ownerPhone };
 }
 
 // يرجّع رصيد المستخدم: المتبقي المجاني + الرصيد المدفوع
@@ -1131,7 +1195,8 @@ app.get('/webhook', (req, res) => {
 const WELCOME_MESSAGE =
   'أهلاً وسهلاً 👋\n\n' +
   'أنا "تعاوني" — مساعدك للأسئلة عن قوانين وقرارات العمل التعاوني والعمل في الكويت.\n\n' +
-  `عندك ${TOTAL_FREE_LIMIT} أسئلة مجانية (بحد ${DAILY_FREE_LIMIT} يومياً). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚`;
+  `عندك ${TOTAL_FREE_LIMIT} أسئلة مجانية (بحد ${DAILY_FREE_LIMIT} يومياً). اكتب سؤالك مباشرة وأجاوبك من النصوص الرسمية 📚\n\n` +
+  '🎁 وتقدر تكسب أسئلة مجانية إضافية بدعوة أصدقائك — اكتب: دعوة';
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -1195,6 +1260,45 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    // أمر: استخدام كود دعوة — "كود ABC123" أو "دعوة ABC123"
+    const redeemMatch = cmd.match(/^(?:كود|دعوة)\s+([A-Za-z0-9]{4,12})$/);
+    if (redeemMatch) {
+      const result = await redeemReferral(from, redeemMatch[1]);
+      if (result.ok) {
+        await sendMessage(from,
+          `🎉 تم! حصلت على ${REFERRAL_INVITEE_REWARD} أسئلة مجانية.\n\nاكتب سؤالك مباشرة 📚`
+        );
+        // نبلّغ صاحب الكود بمكافأته
+        await sendMessage(result.ownerPhone,
+          `🎁 صديق انضم عن طريق كودك!\nحصلت على ${REFERRAL_INVITER_REWARD} أسئلة مجانية. شكراً لنشرك تعاوني 🙏`
+        );
+      } else if (result.reason === 'self') {
+        await sendMessage(from, 'ما تقدر تستخدم كودك الخاص 🙂\nشاركه مع أصدقائك عشان تكسب أسئلة.');
+      } else if (result.reason === 'already') {
+        await sendMessage(from, 'سبق واستخدمت كود دعوة من قبل 🙏\nبس تقدر تدعو غيرك وتكسب — اكتب: دعوة');
+      } else {
+        await sendMessage(from, 'الكود غير صحيح ⚠️\nتأكد منه وحاول مرة ثانية.');
+      }
+      return;
+    }
+
+    // أمر: كود الدعوة الخاص بالمستخدم — "دعوة" أو "احالة"
+    if (cmd === 'دعوة' || cmd === 'احالة' || cmd === 'إحالة') {
+      const code = await getOrCreateReferralCode(from);
+      let msg =
+        '🎁 ادعُ أصدقاءك واكسب أسئلة مجانية!\n\n' +
+        `كودك الخاص: *${code}*\n\n` +
+        `لمن يرسل صديقك للبوت هالرسالة:\nكود ${code}\n\n` +
+        `➕ صديقك يحصل على ${REFERRAL_INVITEE_REWARD} أسئلة، وأنت على ${REFERRAL_INVITER_REWARD} أسئلة — عن كل صديق ينضم! 🌟`;
+      const botNum = (process.env.BOT_NUMBER || '').replace(/\D/g, '');
+      if (botNum) {
+        const link = `https://wa.me/${botNum}?text=${encodeURIComponent('كود ' + code)}`;
+        msg += `\n\n🔗 رابط جاهز للمشاركة:\n${link}`;
+      }
+      await sendMessage(from, msg);
+      return;
+    }
+
     // تقييم الرد بإيموجي (👍/👎): يُربط بآخر سؤال — لا يُحسب سؤالاً ولا يذهب للموديل
     const feedback = parseFeedbackEmoji(text);
     if (feedback) {
@@ -1220,13 +1324,15 @@ app.post('/webhook', async (req, res) => {
         await sendMessage(from,
           'خلصت أسئلتك المجانية لهذا اليوم 🔒\n\n' +
           'تقدر تسأل من جديد بكرا، أو تشحن رصيد أسئلة تستخدمه وقت ما تحب.\n\n' +
-          '📦 باقة: 10 د.ك = 30 سؤال (بدون انتهاء).\nللشحن تواصل معنا.'
+          '📦 باقة: 10 د.ك = 30 سؤال (بدون انتهاء).\nللشحن تواصل معنا.\n\n' +
+          '🎁 أو ادعُ أصدقاءك واكسب أسئلة مجانية — اكتب: دعوة'
         );
       } else if (access.reason === 'no_balance') {
         await sendMessage(from,
           'خلصت أسئلتك المجانية 🔒\n\n' +
           'للاستمرار اشحن رصيد أسئلة — تستخدمه وقت ما تحب بدون انتهاء.\n\n' +
-          '📦 باقة: 10 د.ك = 30 سؤال.\nللشحن تواصل معنا.'
+          '📦 باقة: 10 د.ك = 30 سؤال.\nللشحن تواصل معنا.\n\n' +
+          '🎁 أو ادعُ أصدقاءك واكسب أسئلة مجانية — اكتب: دعوة'
         );
       } else if (access.reason === 'daily_limit_paid') {
         await sendMessage(from,
