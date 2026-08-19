@@ -69,7 +69,22 @@ async function initDatabase() {
     console.error('Database init error:', error.message);
   }
 }
-initDatabase();
+// ترحيل لمرة واحدة: تصفير نقاط كل الأرقام غير الـwhitelist لبداية إطلاق نظيفة.
+// محميّ بعلامة في app_flags حتى لا يتكرر ويصفّر العملاء الحقيقيين لاحقاً.
+async function oneTimePointsReset() {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS app_flags (key VARCHAR(64) PRIMARY KEY, created_at TIMESTAMP DEFAULT NOW())`);
+    const flag = await pool.query(`SELECT key FROM app_flags WHERE key = 'points_reset_v1'`);
+    if (flag.rows.length > 0) return; // سبق ونُفّذ
+    const r = await pool.query(`UPDATE users SET points = 0 WHERE phone <> ALL($1::text[])`, [WHITELIST]);
+    await pool.query(`INSERT INTO app_flags (key) VALUES ('points_reset_v1') ON CONFLICT DO NOTHING`);
+    console.log(`One-time points reset → ${r.rowCount} users zeroed`);
+  } catch (e) {
+    console.error('oneTimePointsReset error:', e.message);
+  }
+}
+
+initDatabase().then(oneTimePointsReset);
 
 const sectionsData = JSON.parse(fs.readFileSync('sections.json', 'utf8'));
 
